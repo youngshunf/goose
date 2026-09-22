@@ -206,6 +206,123 @@ than falling back to a generated id)?
 /// propagates unchanged.
 ```
 
+## 待回馈上游
+
+> ⚠️ 本节与上面那节**不是一回事**：上面那节是「我们已经打了 patch，材料备好等授权提 PR」；
+> 本节是「**我们没打 patch**，而是希望上游加一个能力／修一个 bug」。
+> ⛔ 本节任何一条都**还没有**向上游提过 issue 或 PR——对外动作要主人授权。
+>
+> **为什么不自己打 patch**：这两条动的都是**上游的公开面**（一个公开枚举、一个 Cargo
+> feature 声明）。薄 patch 纪律逐字「内核逻辑非改不可时**优先回馈上游**」，
+> 而公开面的改动尤其要先跟上游谈——悄悄改一个公开枚举，每次 rebase 都要重打，
+> 且上游哪天自己加了一个形状不同的等价物就变成两套。
+
+### `F-1`（唤星侧代号 `A4`）：内核把**终态原因**压成了一句英文正文，嵌入方判别不了
+
+**登记方**：唤星 `K5`（`hasn-node` `modules/runtime-host/goose/src/events.rs`，2026-09-22）。
+**现读基线**：fork `hasn` 分支 `4f1b751c`（= 上游 `5e909259` + 我们的 `#1`）。
+
+#### 现象
+
+内核在**若干条终局路径**上的做法是：yield 一条普通的 assistant 消息，然后 `break`。
+消费 `AgentEvent` 流的嵌入方看到的与「模型正常答完了一句话」**在类型上完全一样**：
+
+| 终局 | 内核吐什么 | 坐标 |
+|---|---|---|
+| 上游连续返回空应答，重试 `MAX_EMPTY_TURN_RETRIES` 次之后 | `Message::assistant().with_text(EMPTY_TURN_MESSAGE)` | `agents/agent.rs:3452`（常量在 `:94`，**私有 `const`**） |
+| 到 `SessionConfig.max_turns` 上界 | `Message::assistant().with_text(MAX_TURNS_MESSAGE)` | `agents/agent.rs:2646`（常量本体在 `agents/state_machine/ops_maxturns.rs:14`，它自己虽是 `pub const`，但 `ops_maxturns` 是**私有模块**（`state_machine/mod.rs:16`），对外只有 `state_machine/mod.rs:59` 那条 `pub(super) use` ⇒ **crate 外引用不到**） |
+| 压缩之后上下文仍然超限 | `SystemNotification(InlineMessage, "Unable to continue: Context limit still exceeded after compaction.")` | `agents/agent.rs:3188` |
+| provider 拒答（`ProviderError::Refusal`） | `Message::assistant().with_text("The provider refused this request…")` | `agents/agent.rs:3271` |
+
+⇒ **嵌入方会把「上游一个字节都没给」报成这一轮成功**，而主人看到的是分身突然说了一句英文。
+第三行更隐蔽：那条 `InlineMessage` 与压缩进度提示（`"Compacting to continue conversation…"`）
+**是同一个 `SystemNotificationType`**，一个是终局一个是进度，类型上分不开。
+
+#### 🔴 「把那几个常量对外放出来」不是修法，已评估并否决
+
+| | 抄一份字面量 | 常量对外可见之后引用它 |
+|---|---|---|
+| 上游改文案 | 静默失配 | 静默失配（**除非**同批 bump rev 且有人盯着） |
+| 那句话由别的原因产生 | 误判 | **一样误判** |
+
+三条理由，缺一条都还能争：
+
+1. **它没有换掉判据的性质**，只换掉了「字面量从哪抄来」——两侧都是字符串相等判定；
+2. **按构造就分不干净**：`MAX_TURNS_MESSAGE` 是 `last_assistant_text`，会沿子配方/子分身
+   那条链变成**父分身的 `ToolResponse`**（现读
+   `agents/state_machine/tests/recipe_scheduling_lifecycle.rs:162` 逐字
+   `assert_message(-2, ToolResponse, MAX_TURNS_MESSAGE)`）。同一字面量在两种角色里都合法
+   ⇒ 相等判定天然有假阳；
+3. **它只闭得了半格**：`EMPTY_TURN_MESSAGE` 连 `pub(super)` 都不是，要用同一手法就得
+   再提一次可见性。**一条禁令要靠开两个口子来绕过，说明禁的是对的。**
+
+#### 诉求：一个**类型上分得开**的信号
+
+两种形状都能解决，**优先 (a)**：
+
+```rust
+// (a) 给 AgentEvent 加一格（goose-agent/src/events.rs）
+pub enum AgentEvent {
+    Message(Message),
+    Usage(ProviderUsage),
+    MessageUsage { message_id: Option<String>, usage: MessageUsage },
+    McpNotification((String, ServerNotification)),
+    HistoryReplaced(Conversation),
+    /// 这一轮为什么结束。正常答完时是 `Completed`。
+    TurnEnded(TurnEndReason),
+}
+
+#[non_exhaustive]
+pub enum TurnEndReason {
+    Completed,
+    MaxTurnsReached,
+    EmptyTurnRetriesExhausted,
+    ContextLimitExceededAfterCompaction,
+    ProviderRefused,
+    CreditsExhausted,
+}
+```
+
+```text
+(b) 退而求其次：保留那条正文，把原因挂到消息元数据上
+    （MessageMetadata 加一个 end_reason: Option<TurnEndReason>）。
+```
+
+**为什么 (a) 更好**：`AgentEvent` 加一格之后，任何写了**穷举 `match`** 的消费方会在
+**编译期**被点名。唤星这一侧的 `agent_event_signals` 正是无通配臂的穷举 `match`
+⇒ 上游合了这一格，我们当场编译失败并被逼着回答它。(b) 是一个可选字段，
+漏读它的消费方继续静默。
+
+⚠️ **这是公开枚举的改动**，因此流程是**先开 issue 讨论形状、再提 PR**，
+⛔ 不适合塞进一条薄 patch 悄悄改。
+
+#### 唤星这一侧在等它的那条登记
+
+`hasn-node` `modules/runtime-host/goose/tests/it/dispatch.rs::上游静默关流在新形态下退化成一条正文这是登记在案的缺口`
+是一条**会说话的**断言：它**故意断言当前这个退化形态**（终态是 `Final`），
+上游给了可判别信号、我们接上之后终态变回 `Failed`，它当场红并提醒删掉那段登记。
+⛔ 不要因为「它看起来在断言一个 bug」就把它删掉。
+
+同族还有 `modules/runtime-host/goose/src/events.rs` 头注里那条：`InlineMessage` 里混着终局，
+我们今天只能把整类 `InlineMessage` 当进度处理（否则每一轮自动压缩都会失败）。
+
+### `F-2`：`crates/goose` 独立构建缺 `process-wrap/process-session` feature 声明
+
+**登记方**：唤星 `K2`（施工文档 §1.5 `B3`）。**性质**：上游的一个 bug，不是我们的需求。
+
+`crates/goose/src/agents/platform_extensions/developer/shell.rs:216` 逐字
+`use process_wrap::std::{CommandWrap, ProcessSession};`，而 `ProcessSession` 在
+process-wrap 9.1.0 里挂在 **`process-session`** feature 后面；
+`crates/goose/Cargo.toml` 只声明了 `features = ["std"]`。
+
+它在上游自己的 workspace 里能过，是因为同一 workspace 里的 `crates/goose-mcp`
+声明了 `features = ["std", "process-session"]`，**cargo 的 feature 合一把那一格捎带打开了**。
+把 `goose` 单独当依赖拉出来时没有那个捎带 ⇒ **`E0432`**。
+
+**修法**：`crates/goose/Cargo.toml` 那一行补上 `"process-session"`，一个词。
+唤星今天的绕法是在**消费方**声明同一个 feature（一条我们一行都不 `use` 的
+`process-wrap` 依赖），rev 一字未动；上游修掉之后那条依赖可以删。
+
 ## 建仓基线（2026-09-04，RT-0）
 
 fork 自上游 `aaif-goose/goose`，建仓时 `origin/main` 与 `upstream/main` 完全同步。
