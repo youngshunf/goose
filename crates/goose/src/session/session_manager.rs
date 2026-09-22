@@ -429,6 +429,34 @@ impl SessionManager {
             .await
     }
 
+    /// 用**调用方给定的 `id`** 建会话。
+    ///
+    /// [`SessionManager::create_session`] 让存储层在 SQL 里现算一个 `YYYYMMDD_N`
+    /// 形态的 id，于是**把 goose 嵌进自己进程里的宿主**（它自己已经有一套会话身份）
+    /// 没有任何一条路能「用我的 id 建会话」：`Agent::reply` 紧接着
+    /// `get_session(&session_config.id, true)`，查不到就 `Err`。本函数补的就是这一条。
+    ///
+    /// ⚠️ [`SessionManager::create_session`] 的行为与签名一字未动，
+    /// 现有调用方一个都不受影响。
+    ///
+    /// # 错误
+    ///
+    /// `id` 已存在时**确定失败**——`sessions.id` 的主键约束当场拒绝，错误原样上抛
+    /// （`UNIQUE constraint failed: sessions.id`）。⛔ 不会退回自动生成的 id：
+    /// 调用方给的 id 就是它自己的身份，静默改写等于让它再也拿不回这条会话。
+    pub async fn create_session_with_id(
+        &self,
+        id: &str,
+        working_dir: PathBuf,
+        name: String,
+        session_type: SessionType,
+        goose_mode: GooseMode,
+    ) -> Result<Session> {
+        self.storage
+            .create_session_with_id(id, working_dir, name, session_type, goose_mode)
+            .await
+    }
+
     pub async fn get_session(&self, id: &str, include_messages: bool) -> Result<Session> {
         self.storage.get_session(id, include_messages).await
     }
@@ -1636,6 +1664,45 @@ impl SessionStorage {
             .bind(goose_mode.to_string())
             .fetch_one(&mut *tx)
             .await?;
+
+        tx.commit().await?;
+        #[cfg(feature = "telemetry")]
+        crate::posthog::emit_session_started();
+        Ok(session)
+    }
+
+    /// 用**调用方给定的 `id`** 建会话。
+    ///
+    /// 与 [`SessionStorage::create_session`] 的唯一差别是 id 从哪来：那一条在 SQL 里
+    /// 现算 `YYYYMMDD_N`，本条把 `id` 直接绑进 `INSERT`。其余六列的取值、事务隔离级别
+    /// （`BEGIN IMMEDIATE`）与 telemetry 埋点逐字相同。
+    ///
+    /// `id` 撞上已有行时由 `sessions.id` 的主键约束拒绝，错误原样上抛。
+    async fn create_session_with_id(
+        &self,
+        id: &str,
+        working_dir: PathBuf,
+        name: String,
+        session_type: SessionType,
+        goose_mode: GooseMode,
+    ) -> Result<Session> {
+        let pool = self.pool().await?;
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+
+        let session = sqlx::query_as(
+            r#"
+                INSERT INTO sessions (id, name, user_set_name, session_type, working_dir, extension_data, goose_mode)
+                VALUES (?, ?, FALSE, ?, ?, '{}', ?)
+                RETURNING *
+                "#,
+        )
+        .bind(id)
+        .bind(&name)
+        .bind(session_type.to_string())
+        .bind(&*working_dir.to_string_lossy())
+        .bind(goose_mode.to_string())
+        .fetch_one(&mut *tx)
+        .await?;
 
         tx.commit().await?;
         #[cfg(feature = "telemetry")]
@@ -3073,6 +3140,105 @@ mod tests {
         sm.add_message(session_id, &Message::user().with_text("hello world"))
             .await
             .unwrap();
+    }
+
+    /// ⭐ **调用方给的 id 逐字落库，而且同一个 id 第二次是确定失败。**
+    ///
+    /// 四段断言，缺一段就证明不了事：
+    ///
+    /// 1. 建出来那条会话的 `id` **逐字等于**调用方给的字符串
+    ///    （非真空对照：它不是 `YYYYMMDD_N` 形态，自动生成永远给不出这个值）；
+    /// 2. 同一个 id 第二次建 **必须 `Err`**——⛔ 不是静默换一个 id 建出第二条；
+    /// 3. 第二次失败之后库里仍然只有第一条，`name` 还是第一次那个
+    ///    （这一条钉住「没有静默改写」：若第二次真的换了 id 建成，本断言看不出来，
+    ///    所以还要第 4 条——列出全部会话，数量必须是 1）。
+    #[tokio::test]
+    async fn create_session_with_id_keeps_the_caller_id_and_rejects_a_duplicate() {
+        let temp_dir = TempDir::new().unwrap();
+        let sm = SessionManager::new(temp_dir.path().to_path_buf());
+
+        let caller_id = "conv_0199240a-8040-7cd1-987a-0fe61fb19206";
+        let session = sm
+            .create_session_with_id(
+                caller_id,
+                PathBuf::from("/tmp/test"),
+                "first".to_string(),
+                SessionType::User,
+                GooseMode::default(),
+            )
+            .await
+            .unwrap();
+
+        // ① 逐字。
+        assert_eq!(session.id, caller_id);
+        assert_eq!(
+            sm.get_session(caller_id, false).await.unwrap().id,
+            caller_id
+        );
+
+        // ② 同一个 id 第二次：确定失败。
+        let second = sm
+            .create_session_with_id(
+                caller_id,
+                PathBuf::from("/tmp/test"),
+                "second".to_string(),
+                SessionType::User,
+                GooseMode::default(),
+            )
+            .await;
+        assert!(
+            second.is_err(),
+            "同一个 id 第二次居然建成了——调用方的会话身份被静默改写了"
+        );
+
+        // ③ 那条会话没有被第二次调用动过。
+        assert_eq!(
+            sm.get_session(caller_id, false).await.unwrap().name,
+            "first"
+        );
+
+        // ④ 库里就这一条：第二次没有「换个 id 悄悄建一条」。
+        let all = sm.list_all_sessions().await.unwrap();
+        assert_eq!(
+            all.len(),
+            1,
+            "第二次调用没报错以外的方式落了第二条会话：{:?}",
+            all.iter().map(|s| s.id.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    /// ⭐ **非真空对照：既有 `create_session` 的 id 生成方式一字未改。**
+    ///
+    /// 这一条是上一条的对照面——它证明新增的那条路是**另一条**路，
+    /// 而不是把既有 `create_session` 改成了「由调用方给 id」。
+    #[tokio::test]
+    async fn create_session_still_generates_its_own_dated_id() {
+        let temp_dir = TempDir::new().unwrap();
+        let sm = SessionManager::new(temp_dir.path().to_path_buf());
+
+        let session = sm
+            .create_session(
+                PathBuf::from("/tmp/test"),
+                "generated".to_string(),
+                SessionType::User,
+                GooseMode::default(),
+            )
+            .await
+            .unwrap();
+
+        // ⚠️ 判的是**形状**不是那一天的字面量：跨 UTC 零点时后者会假红。
+        let (date, seq) = session.id.split_once('_').unwrap_or_else(|| {
+            panic!(
+                "既有 create_session 的 id 不再是 `日期_序号` 形态：{}",
+                session.id
+            )
+        });
+        assert!(
+            date.len() == 8 && date.chars().all(|c| c.is_ascii_digit()),
+            "既有 create_session 的 id 前八位不再是日期：{}",
+            session.id
+        );
+        assert_eq!(seq, "1", "空库里第一条会话的序号应当是 1：{}", session.id);
     }
 
     #[tokio::test]
