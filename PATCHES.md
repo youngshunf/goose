@@ -491,6 +491,31 @@ resolver 2 在只编 lib 时**不做 dev-dep 的 feature 合一** ⇒ `cargo che
   它仍是独立 crate（`events/inference/lib/machine/operation/tool` 六个文件），本轮只动了
   `inference.rs`（`+48/−47`）；**`Agent::reply` 仍在 `crates/goose/src/agents/agent.rs`，没有搬家。**
 
+### 2026-09-22 晚：上游又走了 1 笔，**本次有意不合**（登记，不是漏了）
+
+| 项 | 值 |
+|---|---|
+| 上游新 HEAD | `bfbbf4463`（`fix(acp): prevent duplicate schedules from overwriting recipes (#12434)`） |
+| `main`（上游镜像）| 已 ff 到 `bfbbf4463`，并**首次推上 origin**（此前 `origin/main` 落后 102 笔，从建仓起就没推过） |
+| `hasn` | 仍停在 `b949bbcde`，**没有合这一笔** |
+| `origin/hasn` | 已推到 `b949bbcde`（主人 2026-09-22 授权推 fork） |
+
+🔴 **不合的理由是时机，不是内容**：合 `main` 进 `hasn` 会改**工作树**，而当时
+`hasn-node` 有两片在制 agent 正把本仓当**只读参照**在读坐标
+（`extension_manager/mod.rs::add_client`、`api_client.rs::AuthMethod`）。
+改工作树会让它们读到的行号漂掉，而那种错**不会红**，只会让施工照着错坐标做。
+
+📌 **触发条件**：那两片落地后，连同**下一次 `rev` bump 一起做**——
+合上游、编一遍、bump `hasn-node` 的 5 行 `rev =`，是同一批事。
+⚠️ 分开做没有收益：一次上游合并不编译就等于没验证，而编译只发生在 bump 那一刻。
+
+⚠️ **`rev` 钉的 `855d73e4` 仍在 `origin/hasn` 的历史上**（是 `b949bbcde` 的祖先）
+⇒ `cargo fetch` 取得到，本次推送**没有**动 `hasn-node` 的任何构建输入。
+
+⛔ **本次没做的，如实记**：上游那一笔**没有编译验证**（本仓一行代码没动，
+工作树与 `855d73e4` 之间只差一个 docs 提交）；薄 patch `#1` 对 `bfbbf4463` 的相容性
+**未核**——归 bump 那一片，按上一节那张表逐条重跑。
+
 ## 消费方
 
 `hasn-node` 经 cargo git 依赖消费本仓，`rev` 钉死、**不跟分支**：
