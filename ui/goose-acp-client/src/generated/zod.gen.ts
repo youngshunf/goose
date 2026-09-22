@@ -179,6 +179,7 @@ export const zSetToolPermissionsResponse_unstable = z.record(z.string(), z.unkno
  */
 export const zGooseToolCallRequest_unstable = z.object({
     sessionId: z.string(),
+    extensionName: z.string(),
     name: z.string(),
     arguments: z.unknown().optional().default(null)
 });
@@ -422,11 +423,42 @@ export const zSteerSessionResponse_unstable = z.object({
     messageId: z.string()
 });
 
-export const zDiagnosticsReportLevel = z.enum(['summary', 'full']);
+/**
+ * Ask whether a new or existing chat can enter direct Live voice.
+ */
+export const zLiveVoiceAvailabilityRequest_unstable = z.object({
+    sessionId: z.string().nullish(),
+    _meta: z.record(z.string(), z.unknown()).nullish()
+});
+
+export const zLiveVoiceStatus = z.enum(['ready', 'unavailable']);
+
+export const zLiveVoiceAvailabilityResponse_unstable = z.object({
+    status: zLiveVoiceStatus,
+    message: z.string()
+});
 
 /**
  * Get a diagnostic report for a session.
  */
+export const zLiveVoiceStartRequest_unstable = z.object({
+    sessionId: z.string(),
+    offerSdp: z.string(),
+    _meta: z.record(z.string(), z.unknown()).nullish()
+});
+
+export const zLiveVoiceStartResponse_unstable = z.object({
+    interactionId: z.string(),
+    answerSdp: z.string()
+});
+
+export const zLiveVoiceStopRequest_unstable = z.object({
+    sessionId: z.string(),
+    interactionId: z.string()
+});
+
+export const zDiagnosticsReportLevel = z.enum(['summary', 'full']);
+
 export const zDiagnosticsGetRequest_unstable = z.object({
     sessionId: z.string(),
     level: zDiagnosticsReportLevel.optional().default('summary')
@@ -746,7 +778,8 @@ export const zCustomProviderCreateRequest_unstable = z.object({
     requiresAuth: z.boolean(),
     catalogProviderId: z.string().nullish(),
     basePath: z.string().nullish(),
-    preservesThinking: z.boolean().nullish()
+    preservesThinking: z.boolean().nullish(),
+    toolshim: z.boolean()
 });
 
 export const zProviderConfigStatusDto = z.object({
@@ -798,6 +831,7 @@ export const zCustomProviderConfigDto = z.object({
     requiresAuth: z.boolean(),
     catalogProviderId: z.string().nullish(),
     basePath: z.string().nullish(),
+    toolshim: z.boolean(),
     apiKeyEnv: z.string().nullish(),
     apiKeySet: z.boolean(),
     preservesThinking: z.boolean()
@@ -824,7 +858,8 @@ export const zCustomProviderUpdateRequest_unstable = z.object({
     requiresAuth: z.boolean(),
     catalogProviderId: z.string().nullish(),
     basePath: z.string().nullish(),
-    preservesThinking: z.boolean().nullish()
+    preservesThinking: z.boolean().nullish(),
+    toolshim: z.boolean()
 });
 
 export const zCustomProviderUpdateResponse_unstable = z.object({
@@ -2230,6 +2265,13 @@ export const zMessageUsageUpdate = z.object({
     usage: zMessageUsageData
 });
 
+export const zLiveVoiceInteractionOutcome = z.enum(['stopped', 'failed']);
+
+export const zLiveVoiceInteractionEndedUpdate = z.object({
+    interactionId: z.string(),
+    outcome: zLiveVoiceInteractionOutcome
+});
+
 /**
  * Discriminated union of goose-specific session update payloads.
  * Variant tag matches ACP's convention (`sessionUpdate: "<snake_case>"`).
@@ -2241,7 +2283,8 @@ export const zMessageUsageUpdate = z.object({
 export const zGooseSessionUpdate = z.discriminatedUnion('sessionUpdate', [
     zSessionUsageUpdate.extend({ sessionUpdate: z.literal('usage_update') }),
     zStatusMessageUpdate.extend({ sessionUpdate: z.literal('status_message') }),
-    zMessageUsageUpdate.extend({ sessionUpdate: z.literal('message_usage') })
+    zMessageUsageUpdate.extend({ sessionUpdate: z.literal('message_usage') }),
+    zLiveVoiceInteractionEndedUpdate.extend({ sessionUpdate: z.literal('live_voice_interaction_ended') })
 ]);
 
 /**
@@ -2299,6 +2342,9 @@ export const zExtRequest = z.object({
             zUpdateWorkingDirRequest_unstable,
             zSetSessionSystemPromptRequest_unstable,
             zSteerSessionRequest_unstable,
+            zLiveVoiceAvailabilityRequest_unstable,
+            zLiveVoiceStartRequest_unstable,
+            zLiveVoiceStopRequest_unstable,
             zDiagnosticsGetRequest_unstable,
             zListPromptsRequest_unstable,
             zGetPromptRequest_unstable,
@@ -2414,6 +2460,8 @@ export const zExtResponse = z.union([
                 zAppsImportResponse_unstable,
                 zAppsDeleteResponse_unstable,
                 zSteerSessionResponse_unstable,
+                zLiveVoiceAvailabilityResponse_unstable,
+                zLiveVoiceStartResponse_unstable,
                 zDiagnosticsGetResponse_unstable,
                 zListPromptsResponse_unstable,
                 zGetPromptResponse_unstable,

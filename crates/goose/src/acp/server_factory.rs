@@ -1,7 +1,9 @@
 use crate::acp::server::{
-    AcpBuiltinSelection, AcpProviderFactory, ActiveRunRegistry, GooseAcpAgent, GooseAcpAgentOptions,
+    AcpBuiltinSelection, AcpProviderFactory, ActiveRunRegistry, GooseAcpAgent,
+    GooseAcpAgentOptions, LiveVoiceService,
 };
 use crate::agents::GoosePlatform;
+use crate::config::paths::Paths;
 use crate::scheduler_trait::SchedulerTrait;
 use crate::session::SessionManager;
 use crate::source_roots::SourceRoot;
@@ -12,7 +14,6 @@ use tracing::info;
 
 pub struct AcpServerFactoryConfig {
     pub builtins: AcpBuiltinSelection,
-    pub data_dir: std::path::PathBuf,
     pub config_dir: std::path::PathBuf,
     pub goose_platform: GoosePlatform,
     pub additional_source_roots: Vec<SourceRoot>,
@@ -25,16 +26,23 @@ pub struct AcpServerFactoryConfig {
 
 pub struct AcpServer {
     config: AcpServerFactoryConfig,
+    data_dir: std::path::PathBuf,
     scheduler: OnceCell<Arc<dyn SchedulerTrait>>,
-    active_prompt_runs: ActiveRunRegistry,
+    active_runs: Arc<ActiveRunRegistry>,
+    live_voice: Arc<crate::acp::server::LiveVoiceService>,
 }
 
 impl AcpServer {
     pub fn new(config: AcpServerFactoryConfig) -> Self {
+        let data_dir = Paths::data_dir();
+        let active_runs = Arc::new(ActiveRunRegistry::default());
+        let live_voice = Arc::new(LiveVoiceService::from_config(active_runs.clone()));
         Self {
             config,
+            data_dir,
             scheduler: OnceCell::new(),
-            active_prompt_runs: ActiveRunRegistry::default(),
+            active_runs,
+            live_voice,
         }
     }
 
@@ -50,7 +58,7 @@ impl AcpServer {
             return Ok(None);
         }
 
-        let data_dir = self.config.data_dir.clone();
+        let data_dir = self.data_dir.clone();
         self.scheduler
             .get_or_try_init(|| async move {
                 let session_manager = Arc::new(SessionManager::new(data_dir.clone()));
@@ -116,19 +124,36 @@ impl AcpServer {
         let agent = GooseAcpAgent::new(GooseAcpAgentOptions {
             provider_factory,
             builtin_selection: self.config.builtins.clone(),
-            data_dir: self.config.data_dir.clone(),
+            data_dir: self.data_dir.clone(),
             config_dir: self.config.config_dir.clone(),
             disable_session_naming,
             goose_platform: self.config.goose_platform.clone(),
             additional_source_roots: self.config.additional_source_roots.clone(),
             session_cwd,
             scheduler,
-            active_prompt_runs: self.active_prompt_runs.clone(),
+            active_runs: self.active_runs.clone(),
+            live_voice: self.live_voice.clone(),
         })
         .await?;
         info!("Created new ACP agent");
 
         Ok(Arc::new(agent))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test(
+        config: AcpServerFactoryConfig,
+        data_dir: std::path::PathBuf,
+    ) -> Self {
+        let active_runs = Arc::new(ActiveRunRegistry::default());
+        let live_voice = Arc::new(LiveVoiceService::from_config(active_runs.clone()));
+        Self {
+            config,
+            data_dir,
+            scheduler: OnceCell::new(),
+            active_runs,
+            live_voice,
+        }
     }
 }
 
@@ -137,15 +162,17 @@ mod tests {
     use super::*;
 
     fn server(data_dir: std::path::PathBuf, enable_scheduler: bool) -> AcpServer {
-        AcpServer::new(AcpServerFactoryConfig {
-            builtins: AcpBuiltinSelection::default(),
-            config_dir: data_dir.clone(),
+        AcpServer::new_for_test(
+            AcpServerFactoryConfig {
+                builtins: AcpBuiltinSelection::default(),
+                config_dir: data_dir.clone(),
+                goose_platform: GoosePlatform::GooseCli,
+                additional_source_roots: Vec::new(),
+                session_cwd: None,
+                enable_scheduler,
+            },
             data_dir,
-            goose_platform: GoosePlatform::GooseCli,
-            additional_source_roots: Vec::new(),
-            session_cwd: None,
-            enable_scheduler,
-        })
+        )
     }
 
     #[tokio::test]
@@ -175,8 +202,7 @@ mod tests {
 
         assert!(
             Arc::ptr_eq(a.active_run_registry(), b.active_run_registry()),
-            "each connection's agent must share one per-session run registry so \
-             the active-run guard holds across roaming connections"
+            "each connection's agent must share one per-session run registry"
         );
     }
 
