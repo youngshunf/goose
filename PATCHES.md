@@ -62,7 +62,7 @@ git remote -v
 |---|---|---|
 | 纯新增，一行未删 | `git diff upstream/main...hasn -- crates/goose/src/session/session_manager.rs --stat` | `166 insertions(+), 0 deletions(-)` |
 | 既有 `create_session` 的签名与函数体一字未动 | `git diff upstream/main...hasn -- crates/goose/src/session/session_manager.rs \| grep -c '^-[^-]'` | **`0`**（⚠️ 判据写成 `^-[^-]`，不是「没有以 `-` 开头的行」——`--- a/…` 那行就是以 `-` 开头的，照后者写会永远假红） |
-| 现有调用方零影响 | `grep -rn "create_session(" --include='*.rs' . \| wc -l` | 打 patch 前 **124**，之后 **125**。多的那一处是本 patch 自己那条非真空对照单测；**原有 124 处一处未改**。⚠️ 这个 grep **不会**匹配 `create_session_with_id(`（后者另有 5 处，全是新增） |
+| 现有调用方零影响 | `git grep -n 'create_session(' upstream/main -- '*.rs' \| wc -l` 与同一条打在 `hasn` 上 | 打 patch 前 **129**，之后 **130**（📌 2026-09-22 随上游同步重测，原记的是 `124`/`125`，**差的是上游自己新增的调用点，不是我们的 patch 变胖了**——增量恒为 `+1`）。多的那一处是本 patch 自己那条非真空对照单测；**原有 129 处一处未改**。⚠️ 这个 grep **不会**匹配 `create_session_with_id(`（后者另有 5 处，全是新增）。⚠️ 判据写成 `git grep`，⛔ 别写 `grep -rn … .`：本机 `grep` 被 alias 到 `ugrep`，从父仓根递归时会**跳过全部子仓**（在本仓根跑恰好还对，换个 cwd 就静默给 0） |
 | 不动 schema / 不动迁移 | `git diff upstream/main...hasn --stat` | 只有 `session_manager.rs` 与 `PATCHES.md` 两个文件；`migrate_to_version` 的 `match` 分支一条未加 |
 | id 生成规则本身未动 | 单测 `create_session_still_generates_its_own_dated_id` | 非真空对照：既有 `create_session` 仍给出 `YYYYMMDD_1` |
 
@@ -231,16 +231,169 @@ PoC patch，**不是干净上游**）：
   `agent.rs` 仍是分发处（`:4369` / `:4407`），且 `agents/` 下新增了整个 `state_machine/` 子系统。
   **施工时必须按当时的源码重新定位挂载点，不得照抄 PoC 坐标。**
 
+## 上游同步记录
+
+> 每合一次上游就在这里加一节，**不要覆盖上一节**——「上次同步到哪」是判断 patch 老化速度的唯一依据。
+
+### 2026-09-22：第一次上游同步（建仓后 18 天）
+
+📌 **月度 rebase 此前一次都没发生过，这是第一次。** 且它不是 rebase 是 **merge**：
+`hasn` 已 push 到 `origin`，rebase 会改写已发布历史，而父仓 `CLAUDE.md` §3 禁 force-push。
+
+| 项 | 值 |
+|---|---|
+| 上游 HEAD | `96009644e1a6ef75b97d15560419d9456a005d46`（2026-09-22 04:17:16 +0000，`feat(recipe): enforce parameter limits (#12259)`） |
+| `main` ff-only 后 | 同上（`5e9092596` 是它的祖先，真 fast-forward） |
+| `hasn` 合并提交 | `bb4451fa0b1f759318b6d8ec69bc9561318a595e` |
+| 上游提交数 | **101**，`374 files changed, 38350 insertions(+), 14579 deletions(-)` |
+| 冲突 | **0 个**（`git diff --name-only --diff-filter=U` 空集） |
+| 上游版本 | `1.49.0` → **`1.51.0`** |
+| `edition` / `rust-version` / `rust-toolchain.channel` | `2021` / `1.94.1` / `1.96.1`，**三项一字未动** |
+| workspace crates | **仍是 15 个**，集合一字未变（没有新增也没有删除） |
+
+#### 薄 patch `#1` 的去向：**还在，且仍然有效**——⛔ 不是「机械 resolve 出来的」
+
+上游**没有**提供等价能力：`git grep 'create_session_with_id\|create_with_id' upstream/main` 零命中，
+`SessionStorage::create_session` 的 id 仍在 SQL 里现算 `YYYYMMDD_N`，签名与函数体一字未动。
+
+之所以 0 冲突，是因为上游这 101 笔里只有 **2 笔**碰过 `session_manager.rs`
+（`d213a3b13` live voice、`7d446c848` session 目录 0700），净 `+125/−1`，四个 hunk 分别落在
+`:460` / `:938` / `:2010` / `:2860`，**与我们两处插入点（`create_session` 之后、
+`SessionStorage::create_session` 之后）和测试模块尾部都不相邻**。
+
+⚠️ **「merge 干净」不等于「语义相容」**，所以另外核了两条会让这条 patch 静默失效的：
+
+- `sessions` 表**没有**新增列（我们那条 `INSERT` 写死七列，多一个 `NOT NULL` 就当场炸）；
+- `migrate_to_version` 的 `match` **没有**新增分支。
+
+判据全部重跑见上文「`#1` 的最小性与零影响」表（`166 insertions(+), 0 deletions(-)`、
+`^-[^-]` 计数仍为 `0`、diff 仍只有两个文件）。两条单测在合并后原样重跑：
+
+```
+$ cargo test -p goose --lib session::session_manager::tests::create_session
+test session::session_manager::tests::create_session_still_generates_its_own_dated_id ... ok
+test session::session_manager::tests::create_session_with_id_keeps_the_caller_id_and_rejects_a_duplicate ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 2301 filtered out
+rc=0
+```
+
+⚠️ **rc 要单独抓**：接 `| tail` 之后拿到的是 `tail` 的退出码（本机 zsh 连
+`PIPESTATUS` 都是空的），⛔ 别拿管道尾的 0 当测试通过。
+
+#### 🔴 对消费方的**唯一**破坏性变更：`Agent::reply` 多了一个参数
+
+`b8b17c626 feat(agent): route Desktop to state-machine loop via ACP prompt meta (#11247)`：
+
+```rust
+// 旧（af1e505e，agents/agent.rs:2020）
+pub async fn reply(&self, user_message: Message, session_config: SessionConfig,
+                   cancel_token: Option<CancellationToken>) -> …
+// 新（96009644，agents/agent.rs:2044）
+pub async fn reply(&self, user_message: Message, session_config: SessionConfig,
+                   use_state_machine: bool,                      // ← 新增，插在第 3 位
+                   cancel_token: Option<CancellationToken>) -> …
+```
+
+`state_machine::enabled()` 本身**一字未改**（仍读 `GOOSE_STATE_MACHINE`，缺省 `false`，
+`agents/state_machine/mod.rs:72`，`pub mod state_machine` 仍是公开的）——上游只是把
+「读环境变量」从 `reply` 内部**提到了调用方**。⇒ 想保持旧语义，传
+`goose::agents::state_machine::enabled()`；想确定性关掉，传 `false`。
+上游自己的 CLI 走的是前者（`goose-cli/src/session/mod.rs:1456`）。
+
+**除它之外，我们消费的那一整片公开面一字未动**（逐条现读核过）：`AgentConfig::new` 六参、
+`extend_system_prompt` / `remove_system_prompt_extra`、`PromptManager.system_prompt_extras`
+（仍是 `IndexMap`，有序）、`SessionManager::new` / `get_session`、`PermissionManager::new`、
+`AgentEvent` 五格、`ApiClient::new_with_tls`、`OpenAiCompatibleProvider::new`、
+`update_provider` / `recreate_provider_for_session`、`ExtensionConfig::StreamableHttp` 的字段集、
+`add_extension` / `add_extensions_bulk` / `list_tools`、`submit_tool_confirmation`、
+`GooseMode` 四格、`Paths::get_dir` 的 `GOOSE_PATH_ROOT`（`config/paths.rs` 本轮**零改动**）、
+`SessionConfig` / `GoosePlatform` / `SessionType` / `AuthMethod` / `ModelConfig::new`、
+`goose::session::mod` 与 `goose::config::mod` 的 re-export（两份文件**逐字未动**）。
+
+⚠️ **另有一处公开面收缩，我们恰好没在用**：`goose::agents` 的 re-export 去掉了
+`MCP_PROTOCOL_VERSION`（`agents/mod.rs:29`）。`hasn-node` 全仓零命中 ⇒ 不受影响。
+⛔ 但别把「没影响」记成「没变化」——下次谁想用它会发现它不在了。
+
+⚠️ 还有一处**只在非默认 feature 后面**的变化：`ExtensionError::InitializeError` /
+`ProcessExit` 的载荷从裸类型换成了 `Box<…>`（`extension.rs`）。两个 `From` impl 补上了，
+所以 `?` 照常；**但按变体解构那两个错误的代码会红**。我们今天不解构它们。
+
+#### 依赖形态：两条决定我们仓依赖形状的，**都没变**
+
+| 问题 | 现读 | 结论 |
+|---|---|---|
+| `crates/goose` 的 `sqlx` | 仍是 **`0.9.0`**，`Cargo.lock` 里 `libsqlite3-sys` 仍是 **`0.37.0`** | 🔴 **不能把 `rusqlite` 升回 `0.40`**。`libsqlite3-sys` 带 `links = "sqlite3"`（全图唯一），`sqlx 0.9.0 → libsqlite3-sys <0.38.0` 这条上界一字未松，我们整仓那次退版（`rusqlite 0.39.0` / `libsqlite3-sys =0.37.0`）**必须原样保留** |
+| `crates/goose` 的 `[features] default` | 仍是 **`[]`** | ✅ `default-features = false` 免裁剪的前提成立。本次只新增了一个 **opt-in** feature `live-voice`（并被加进 `portable-default`）；⛔ **没有**任何重依赖被挪进 `default` |
+| `crates/goose-providers` 的 `[features] default` | 仍是 **`[]`** | ✅ 同上 |
+
+🔴 **上游本轮新长出一条出站传输，今天只被 `default-features = false` 挡在门外。**
+`goose-providers` 新增了 `tokio-tungstenite`（WebSocket 客户端，`openai_live.rs` +1265 行、
+`openai_live_voice_provider.rs` +425 行），它挂在 **opt-in** 的 `live-websocket` 后面，
+而 `live-websocket` 只被 `goose/live-voice` 打开、`live-voice` 只在 `portable-default` 里。
+⇒ 消费方保持 `default-features = false` 时它**不进依赖树**。
+
+⚠️ 这正好是 `hasn-node` `modules/runtime-host/goose/Cargo.toml` 里那句
+「上游哪天把某个 feature 挪进 `default`，这一行就是那道拦截」**第一次真的拦到东西**。
+⛔ 别把 `default-features = false` 当成可有可无的形式——删掉它，daemon 依赖树里就会
+多出一个 WebSocket 出站客户端，而 `check-goose-outbound-isolation.py` 判的是**直接**依赖
+与直接 `use`，**判不到这条传递依赖**（那正是它头注登记的缺口 16）。
+
+#### `process-wrap` 那条上游 bug：**上游没修**，绕法照旧
+
+`crates/goose/Cargo.toml:217` 仍是 `process-wrap = { version = "9", default-features = false, features = ["std"] }`，
+而 `agents/platform_extensions/developer/shell.rs:216` 仍逐字
+`use process_wrap::std::{CommandWrap, ProcessSession};`。
+
+实测（2026-09-22，合并后）：
+
+```
+$ cargo check -p goose
+error[E0432]: unresolved import `process_wrap::std::ProcessSession`
+  --> crates/goose/src/agents/platform_extensions/developer/shell.rs:216:42
+note: found an item that was configured out … gated behind the `process-session` feature
+error: could not compile `goose` (lib) due to 1 previous error
+rc=101
+```
+
+⚠️ **为什么本仓自己的 workspace 构建照样绿**：`crates/goose-mcp/Cargo.toml:41` 声明了
+`features = ["std", "process-session"]`，cargo 的 feature 合一把那一格捎带打开了。
+而 `crates/goose` 对 `goose-mcp` 的那条依赖在 **`[dev-dependencies]`**（`Cargo.toml:270`），
+resolver 2 在只编 lib 时**不做 dev-dep 的 feature 合一** ⇒ `cargo check -p goose` 红、
+`cargo test -p goose` 绿。**把 `goose` 单独当依赖拉出来的消费方（我们）永远落在红的那一侧。**
+
+⇒ `hasn-node` 消费方补声明同一个 feature 的绕法（`modules/runtime-host/goose/Cargo.toml`
+那条一行都不 `use` 的 `process-wrap`）**继续需要，不能删**。这仍是应当回馈上游的一条
+（⚠️ 与 `#1` 的 PR 一样，对外动作要主人授权，尚未提交）。
+
+#### 建仓基线那节里两处坐标**已随本次同步过期**（登记，不回改历史）
+
+- `agent.rs` 里 platform tool 的分发坐标 `:4369` / `:4407`：现跑
+  `rg -n manage_schedule crates/goose/src/agents/agent.rs` **零命中**，先例整体在
+  `platform_extensions/scheduler.rs`。**施工时按当时源码重新定位**这条纪律照旧成立；
+- 「`goose-agent` 可能是上游演进方向，每次 rebase 都要重看」这一条**本次重看结论**：
+  它仍是独立 crate（`events/inference/lib/machine/operation/tool` 六个文件），本轮只动了
+  `inference.rs`（`+48/−47`）；**`Agent::reply` 仍在 `crates/goose/src/agents/agent.rs`，没有搬家。**
+
 ## 消费方
 
 `hasn-node` 经 cargo git 依赖消费本仓，`rev` 钉死、**不跟分支**：
 
 ```toml
-# modules/runtime-host/goose/Cargo.toml（现读）
-goose                = { git = "https://github.com/youngshunf/goose.git", rev = "da0ee4c3…", default-features = false }
-goose-providers      = { git = "https://github.com/youngshunf/goose.git", rev = "da0ee4c3…", default-features = false }
-goose-provider-types = { git = "https://github.com/youngshunf/goose.git", rev = "da0ee4c3…" }
+# modules/runtime-host/goose/Cargo.toml（2026-09-22 现读）
+goose                = { git = "https://github.com/youngshunf/goose.git", rev = "<见下表>", default-features = false }
+goose-providers      = { git = "https://github.com/youngshunf/goose.git", rev = "<见下表>", default-features = false }
+goose-provider-types = { git = "https://github.com/youngshunf/goose.git", rev = "<见下表>" }
 ```
+
+| `hasn-node` 分支 | 钉的 rev | 说明 |
+|---|---|---|
+| `main` | `af1e505e` | 建仓基线（RT-0） |
+| `feat/goose-k2b-session-id`、`feat/goose-k3-k4-prompt-and-retire` | `4f1b751c` | 带薄 patch `#1`，**未合回 main** |
+
+📌 **2026-09-22 订正**：本节原写 rev 是 `da0ee4c3…` 并标「现读」。`da0ee4c3` 确实是本仓一个真提交
+（同一条 K2b patch 的**被 rebase 掉的前身**，commit message 一字不差），但 `git grep da0ee4c3` 在
+`hasn-node` 任何分支上**零命中**——照它去核对会核出一条不存在的依赖。⚠️ 抄 rev 要从消费方的
+`Cargo.toml` 现读，⛔ 不要从本文件反向抄。
 
 📌 **2026-09-22 订正**：本节原写「**只引 `goose` 一个 crate**」——那是 RT-0 建仓时的
 预期。`K2` 真内核进编译图之后是**三个**（白名单在 `hasn-node`
