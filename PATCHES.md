@@ -47,11 +47,37 @@ git remote -v
 ⛔ **这条裁决只覆盖 `#1` 这一条。** 再出现第三类 patch 仍要单独裁决，
 ⛔ 不得引用本段当作「内核逻辑可以改了」。
 
+### 🔴 2026-09-23 裁决：批准**第二条**内核逻辑薄 patch（`#2`），⛔ 同样不构成放宽
+
+`#2`（嵌入方显式指定上下文文件名）同样既不是 feature 裁剪也不是平台工具挂载点，
+由验收方 2026-09-23 **单条裁决**批准。理由是：不修就是一条绕过嵌入方提示词权威的通道，
+而不打 patch 的两条路都给不出**可判**的保证。
+
+- **通道**：内核每轮 `agents/reply_parts.rs:233` 无条件 `.with_hints(working_dir)`，
+  工具调用之后经典循环 `agents/agent.rs:3278` 再 `load_subdirectory_hints`、状态机
+  `agents/state_machine/ops_toolcalling.rs:778` 另起一个 `SubdirectoryHintTracker::new()`；
+  三条路的文件名表都来自 `hints/load_hints.rs::get_context_filenames()` ⇒
+  `Config::global()` 的 `CONTEXT_FILE_NAMES`（缺省 `[.goosehints, AGENTS.md]`），
+  向上走到 git 根、展开 `@引用`（坐标均为 `855d73e4`）；
+- **为什么在唤星是真问题**：系统提示词的权威在节点（父仓 ADR
+  `2026-09-22-Runtime内核自持推理循环与会话.md` **E2**，片段按 key 注入与撤销）。
+  `hasn-node` `K8-1` 起内核会话 cwd 是主人可见的分身工作目录，`K8-2` 起分身能
+  `write`/`edit` 它 ⇒ **分身写下的一个 `AGENTS.md` 就是它自己下一轮的系统提示词**，
+  节点的装配器与撤销语义都管不到它；
+- **不打 patch 的两条路都被挡死**：① 拉起方设环境变量——进程内测试与云端容器 entrypoint
+  都覆盖不到，是**不可判**的保证；② 写全局配置文件——落点是 `Paths::config_dir()`，
+  `GOOSE_PATH_ROOT` 缺席时在**主人 home** 下。`Config::global()` 只有配置文件与环境变量两层，
+  **没有进程内覆盖层** ⇒ 只能让嵌入方在装配面上显式传。
+
+⛔ **这条裁决只覆盖 `#2` 这一条。** 第三条内核逻辑 patch 仍要单独裁决，
+⛔ 不得引用本段或上一段当作「内核逻辑可以改了」。
+
 ## 改动登记
 
 | # | 改动点 | 类别 | 理由 | 上游回馈可能性 |
 |---|---|---|---|---|
 | 1 | `crates/goose/src/session/session_manager.rs`：新增 `SessionManager::create_session_with_id` 与其存储层同名实现（**纯新增 166 行，0 删除**） | 内核逻辑（经 2026-09-22 单条裁决，见上） | 既有 `create_session` 的 id 是**在 SQL 里现算**的 `YYYYMMDD_N`，公开面上没有任何一条路能用调用方给的 id 建会话；而 `Agent::reply` 紧接着 `get_session(&session_config.id, true)`（`agents/agent.rs`），查不到就 `Err`。⇒ 嵌入 goose 的宿主（唤星 daemon 已有自己的 `RuntimeSessionId`）**无法让 `SessionConfig.id` 等于自己的会话身份**。另一条路（映射表）被 ADR E4 与施工文档 §2.7 同时挡死 | 🟢 **高**。让嵌入方自带 session id 是通用需求，与唤星业务零耦合。上游 PR 材料见下节，⚠️ 尚未提交（对外动作需主人授权） |
+| 2 | `crates/goose/src/agents/agent.rs`（`AgentConfig.context_file_names` ＋ `with_context_file_names`；`Agent::with_config` 与状态机装配各转交一次）、`agents/prompt_manager.rs`（`PromptManager::with_context_file_names`，`with_hints` 读它）、`agents/state_machine/ops_toolcalling.rs`（`ToolExecutionOperation::with_context_file_names`）、`hints/load_hints.rs`（`SubdirectoryHintTracker::with_context_filenames`）：**嵌入方显式指定上下文文件名**（**+483 / −8**，其中生产代码 **+86 / −8**、测试 +397；删除的 8 行全是 4 处被替换的原表达式，每处的 `None` 分支逐字就是原表达式） | 内核逻辑（经 2026-09-23 单条裁决，见上） | 内核读 hints 的三条路文件名表全部来自 `Config::global()`，**没有进程内覆盖层**；嵌入方持有系统提示词权威、agent 又能写工作根时，agent 写下的 `AGENTS.md` 就是它自己下一轮的系统提示词。环境变量与写全局配置两条路都给不出可判的保证 | 🟢 **高**。「嵌入方决定读哪些上下文文件」是通用需求，缺省行为逐字节不变，与唤星业务零耦合。上游 PR 材料见下节，⚠️ 尚未提交 |
 
 > 加一条 patch 就在上表加一行，**不要攒着**。评审判据是：
 > 这张表的行数 == `git diff upstream/main...hasn` 里非裁剪类改动的处数。
@@ -91,6 +117,76 @@ session::session_manager::tests::create_session`）：
 | 变异经 `git checkout --` 还原后 | 再次 `ok. 2 passed; 0 failed`（rc=0） |
 
 ⇒ 「静默改写 id」这条**唯一**危险行为确实会被这条用例抓住，而不是恰好绿。
+
+### `#2` 的最小性与零影响，逐条可复跑
+
+基点是 `f822c2276`（`#2` 之前的 `hasn`），`#2` 的实现提交是 `70deb52a7`。
+
+| 判据 | 命令 | 事实 |
+|---|---|---|
+| 改动面 | `git diff f822c2276 70deb52a7 --stat -- crates/` | 6 个文件 **+483 / −8**：生产代码 4 个文件 **+86 / −8**（`agent.rs` +30/−6、`prompt_manager.rs` 非测试部分 +30/−1、`ops_toolcalling.rs` +14/−1、`load_hints.rs` +12/−0）；测试 +397（`prompt_manager.rs` 测试模块 +168、新文件 `state_machine/tests/context_files_lifecycle.rs` +228、`tests/mod.rs` +1） |
+| 删除的只有 4 处原表达式，一个签名都没动 | `git diff f822c2276 70deb52a7 -- crates/ \| grep '^-[^-]'` | 恰好 **8** 行：`PromptManager::new()`（`Agent::with_config`）、`get_context_filenames()`（`with_hints`）、`SubdirectoryHintTracker::new()`（状态机 `prompt_parts`）、以及 `ToolExecutionOperation::new(…)` 那一个表达式被 rustfmt 为接上链式调用而重排的 5 行 |
+| `None` 逐字是原行为 | 读 4 处替换 | `PromptManager::with_context_file_names(None)` ≡ `PromptManager::new()`；`None.unwrap_or_else(get_context_filenames)` ≡ `get_context_filenames()`；状态机 `None` 分支 ≡ `SubdirectoryHintTracker::new()`；`ToolExecutionOperation::new` 之后 `.with_context_file_names(None)` 字段仍是 `None` |
+| 既有构造入口零改动 | 同上 diff | `AgentConfig::new`（六参）、`PromptManager::new`、`SubdirectoryHintTracker::new`、`ToolExecutionOperation::new` 的签名与函数体一字未动；`new()` 只多一行 `context_file_names: None` |
+| 读 hints 的生产路径被穷举 | `git grep -n -e get_context_filenames -e 'SubdirectoryHintTracker::new' -e 'load_hint_files(' -e 'PromptManager::new' f822c2276 -- 'crates/*.rs'` | 生产读点恰好 3 条（`with_hints`、`PromptManager` 的跟踪器、状态机 `prompt_parts` 的跟踪器）；`PromptManager` 的生产构造点恰好 1 个（`agent.rs:445`）。其余命中全在测试与 `hints/` 自身 |
+| 结构体字面量构造 `AgentConfig` 的调用方 | `git grep -n 'AgentConfig {' -- 'crates/*.rs'` | 只有 2 行：`pub struct AgentConfig {` 与 `impl AgentConfig {`——**0** 处字面量构造（全仓都走 `AgentConfig::new`）⇒ 新增 `pub` 字段不破坏任何现有构造 |
+
+### `#2` 的行为契约
+
+- **`None`（缺省，不调用 `with_context_file_names`）⇒ 与改前逐字节相同**；
+- **`Some(names)` ⇒ 三条读路都只认 `names`**：每轮系统提示词的 `with_hints`（工作目录向上到
+  git 根每一层、全局配置目录 `Paths::in_config_dir(name)`；`~/.agents/AGENTS.md` 仅当 `names`
+  含 `AGENTS.md`）、经典循环工具调用之后的子目录 hints、状态机工具调用之后的子目录 hints；
+  全局配置的 `CONTEXT_FILE_NAMES` 不再生效；
+- **`Some(vec![])` ⇒ 三条路一个 hints 文件都不读**，system prompt 与「没有 hints」逐字节相同；
+- ⚠️ **不覆盖**：`summon` 派生的子 Agent 自建 `AgentConfig`，**不继承**本字段
+  （唤星不挂 `summon`，`hasn-node` 的挂载闭集判着）；`PromptManager::new()` 构造时仍读一次全局
+  `CONTEXT_FILE_NAMES`（`SubdirectoryHintTracker::new()`），`Some` 时结果被替换丢弃——只读不写，
+  不影响提示词；
+- 📌 **`@引用` 拉不进 `.git/` 元数据，这是上游既有能力，不是本 patch**
+  （`hints/import_files.rs::git_metadata_directories`，上游单测
+  `project_git_metadata_does_not_reach_system_prompt`）。本 patch 关的是 hints 文件本身及其
+  `@引用` 的**全部**合法目标。
+
+判据（`cargo test -p goose --lib`）：
+
+- `agents::prompt_manager::tests` 三条：`explicit_empty_context_file_names_read_no_hint_files`
+  （空表 ⇒ 输出逐字节等于 `"BASE"`，子目录跟踪器读不出）、
+  `explicit_context_file_names_replace_the_global_list`（非空表只认表内）、
+  `unset_context_file_names_match_the_global_config_behaviour_byte_for_byte`
+  （`None` 与 `PromptManager::new()` 都逐字节等于**照改前代码逐步复原**的参照物；
+  参照物一步都不经过被改过的 `with_hints`；含非真空前提）；
+- `agents::state_machine::tests::context_files_lifecycle` 两条，**经 `Agent::reply` 跑两条循环**
+  （`use_state_machine` 取 `false` / `true`），判 provider 真收到的每一次 system prompt：
+  git 根、工作目录 `AGENTS.md`、`.goosehints`、`@引用`、工具调用后才加载的子目录 `AGENTS.md`
+  五处——空表 ⇒ 一处都没有；不指定 ⇒ 前四处首轮就在、第五处工具调用后出现（非真空对照）。
+
+**它们被证伪过**（2026-09-23，`cargo test -p goose --lib -- context_file`，即上面 5 条 ＋ 上游 1 条；每条变异单独一次编译，跑完 `git checkout --` 还原，源码已先提交）：
+
+| 源码 | 结果 |
+|---|---|
+| 原样（`70deb52a7`） | `ok. 6 passed; 0 failed`，同一二进制连跑 3 次、FM4 还原重编后再跑 1 次，全部 rc=0 |
+| **FM1** `with_hints` 无视嵌入方的表（`.map(\|_\| get_context_filenames())`） | rc=101，3 条红：两条空表/非空表单测，与两循环用例的空表那条——失败行逐字「state_machine=false 第 0 次推理：嵌入方给的是空表，hints 文件却进了 system prompt：[PARENT…, WORKING_DIR_AGENTS_MD…, WORKING_DIR_GOOSEHINTS…, AT_IMPORTED_FILE…]」 |
+| **FM2** `PromptManager::with_context_file_names` 不换子目录跟踪器 | rc=101，3 条红：两条单测（`load_subdirectory_hints` 在空表下读出了东西）＋ 两循环用例「state_machine=false 第 1 次推理：…[NESTED_SUBDIRECTORY_AGENTS_MD…]」——**只有工具调用之后那一次**漏 |
+| **FM3** `Agent` 的状态机装配改传 `.with_context_file_names(None)` | rc=101，两循环用例红在**状态机那一支**：「state_machine=true 第 1 次推理：…[NESTED_SUBDIRECTORY_AGENTS_MD…]」；三条 `PromptManager` 单测照绿（它们判不到装配，正说明两循环用例不可省） |
+| **FM4** `None` 不再是原行为（`with_hints` 的缺省分支改成 `unwrap_or_default()`，即空表） | rc=101，2 条红：逐字节用例（`left == right`）＋ 两循环用例的缺省那条「state_machine=false：缺省行为丢了 PARENT_GIT_ROOT_AGENTS_MD…：[]」 |
+| **FM5** `Agent::with_config` 不转交（仍 `PromptManager::new()`） | rc=101，两循环用例空表那条红：「state_machine=false 第 0 次推理：…[四处工作目录 hints]」 |
+
+🔴 **第一轮变异里撞到一条真的假红，已修，记下来**：FM3、FM5 与第一次「原样」复跑时，
+逐字节用例也红了——而那两条变异根本不碰 `prompt_manager.rs`。失败正文里多出来的是
+`### Global Hints … Global agents home instructions`：上游用例
+`hints::load_hints::tests::test_global_agents_md_skipped_when_not_in_context_file_names`
+**裸 `std::env::set_var("GOOSE_PATH_ROOT", …)`、不持锁**，与本用例并行时，本用例前后两次读到了
+不同的全局 hints 块。⇒ 逐字节用例比较前剥掉全局块（`without_global_hints`，理由写在它的头注里），
+⛔ 没有改上游那条用例。修后原样连跑 4 次全绿，FM4 在修后的用例上复验仍红（上表 FM4 行即修后结果）。
+⚠️ FM1–FM3、FM5 跑在修竞态之前的那一版（`0c67aa76f`，未推送、已被 amend 掉）上；
+它们各自红的那几条（两条单测与两循环用例）在两版之间**一字未变**，变的只有逐字节用例的比较方式。
+
+📌 影响面更宽的一轮 `cargo test -p goose --lib -- agents:: hints::`（跑在 `d628fd95f`，与 `70deb52a7` 只差一个测试辅助函数的写法——为过 clippy 的 `string_slice` 改成 `split_once`）：**624 passed / 1 failed**，
+红的是 `agents::prompt_manager::tests::test_all_platform_extensions`，**与 `#2` 无关**：
+快照里有 `## code_execution` 一节，而那个平台扩展挂在 `code-mode` feature 后面
+（`platform_extensions/mod.rs:4`/`:146`），`cargo test -p goose` 不带它 ⇒ 快照缺那一节。
+差异只有那一节；⚠️ 未在 `--features code-mode` 下复跑（`not_run`）。
 
 ## 上游 PR 材料（⚠️ 尚未提交）
 
@@ -205,6 +301,186 @@ than falling back to a generated id)?
 /// A duplicate `id` is rejected by the `sessions.id` primary key and the error
 /// propagates unchanged.
 ```
+
+### `#2` 的上游 PR 材料（⚠️ 尚未提交）
+
+⛔ 与 `#1` 相同：**还没有向上游提任何 issue 或 PR**，对外动作要主人授权。
+⚠️ 上游 `AGENTS.md` 的贡献流程要求「外部 PR 必须链接一个 Board 上状态为 **Ready** 的 issue」
+⇒ 顺序是**先开 issue 讨论形状、等 Ready、再提 PR**，⛔ 别直接提 PR。
+⚠️ 提交前把 `#2` 的中文 doc comment 与测试断言消息换成英文（下面给好了对应英文版）；
+测试文件里的 `唤星 PATCHES.md #2` 字样一并删掉。
+⚠️ 上游 `AGENTS.md` 逐字「changes to agent-loop behavior must be implemented and tested in
+**both paths**」——本 patch 两条循环都改了、测了，PR 正文里要点明。
+
+**目标仓**：`aaif-goose/goose`　**类型**：feature（附测试）　**预计 diff**：+483 / −8（生产 +86 / −8，其余是测试）
+
+**先开的 issue**
+
+```
+Title: Let embedders choose which context files (AGENTS.md / .goosehints) the agent reads
+
+When goose is embedded as a library, the host may own the system prompt and let
+the agent write to its working directory. Today every reply calls
+`with_hints(working_dir)` and, after tool calls, loads subdirectory hints; the
+file names always come from `Config::global()`'s `CONTEXT_FILE_NAMES`. Config has
+only two layers (config file + environment), so a host cannot turn this off for
+its own Agent without mutating process-wide environment or writing the user's
+global config file. As a result an `AGENTS.md` the agent writes becomes part of
+its own next system prompt. Would you accept an additive
+`AgentConfig::with_context_file_names(Vec<String>)` (unset = today's behaviour,
+empty = read no context files) that covers `with_hints` and both subdirectory
+hint trackers (classic loop and state machine)?
+```
+
+**PR 标题**
+
+```
+feat(agents): let embedders choose the context file names the agent reads
+```
+
+**PR 正文**
+
+```markdown
+### Problem
+
+Context files (`.goosehints`, `AGENTS.md`) are read on three paths:
+
+- every reply: `SystemPromptBuilder::with_hints(working_dir)`, walking up to the
+  git root and expanding `@` references;
+- after tool calls in the classic loop: `PromptManager::load_subdirectory_hints`;
+- after tool calls in the state machine: `ToolExecutionOperation::prompt_parts`.
+
+All three take their file names from `Config::global()`'s `CONTEXT_FILE_NAMES`.
+`Config` has no in-process override layer, so an application embedding goose
+cannot choose the file names for its own `Agent`: the only knobs are a
+process-wide environment variable or the user's global config file.
+
+That matters when the host owns the system prompt and the agent can write to its
+working directory: an `AGENTS.md` the agent writes becomes part of its own next
+system prompt, bypassing the host.
+
+### Change
+
+- `AgentConfig::context_file_names: Option<Vec<String>>` plus
+  `AgentConfig::with_context_file_names(Vec<String>)`.
+- `Agent::with_config` passes it to `PromptManager::with_context_file_names`,
+  which `with_hints` and the classic-loop subdirectory tracker read, and to
+  `ToolExecutionOperation::with_context_file_names` for the state machine.
+- `SubdirectoryHintTracker::with_context_filenames(Vec<String>)`.
+
+Unset (`None`) is byte-for-byte today's behaviour: each of the four replaced
+expressions keeps the original expression as its `None` branch, and no existing
+constructor signature changes. An empty list reads no context files at all.
+
+Subagents created by `summon` build their own `AgentConfig` and do not inherit
+the setting; happy to thread it through if you prefer.
+
+### Tests
+
+Both agent loops are covered.
+
+- `prompt_manager::tests::explicit_empty_context_file_names_read_no_hint_files`
+- `prompt_manager::tests::explicit_context_file_names_replace_the_global_list`
+- `prompt_manager::tests::unset_context_file_names_match_the_global_config_behaviour_byte_for_byte`
+  — the reference is rebuilt from the pre-change primitives and never goes
+  through the modified `with_hints`.
+- `state_machine::tests::context_files_lifecycle::*` — drives `Agent::reply` with
+  `use_state_machine` false and true against the dummy provider and checks the
+  system prompt it receives: with an empty list none of the five hint sources
+  (git-root `AGENTS.md`, working-dir `AGENTS.md`, `.goosehints`, an `@`-imported
+  file, a nested `AGENTS.md` loaded after a tool call) appears; unset, all of
+  them do.
+```
+
+**提交前要替换的 doc comment（英文版，逐段对应）**
+
+`AgentConfig::context_file_names`：
+
+```rust
+/// Context file names (hints) chosen by the embedder. `None` reads
+/// `CONTEXT_FILE_NAMES` from the global config (today's behaviour);
+/// `Some(vec![])` reads no context files. See
+/// [`AgentConfig::with_context_file_names`].
+```
+
+`AgentConfig::with_context_file_names`：
+
+```rust
+/// Lets the embedder choose which file names count as context files (hints),
+/// overriding `CONTEXT_FILE_NAMES` from the global config.
+///
+/// The same list governs all three places the agent reads hints: the
+/// working-directory hints in every system prompt (walking up to the git root,
+/// including the global config directory), subdirectory hints after tool calls
+/// in the classic loop, and subdirectory hints after tool calls in the state
+/// machine. An empty list reads no context files.
+///
+/// Leaving it unset keeps today's behaviour byte for byte.
+///
+/// Subagents created by `summon` build their own `AgentConfig` and do not
+/// inherit this setting.
+```
+
+`PromptManager::context_file_names` / `ToolExecutionOperation::context_file_names`：
+
+```rust
+/// Context file names chosen by the embedder. `None` reads `CONTEXT_FILE_NAMES`
+/// from the global config (today's behaviour).
+```
+
+`PromptManager::with_context_file_names`：
+
+```rust
+/// Lets the embedder choose which file names count as context files (hints).
+///
+/// - `None`: identical to [`PromptManager::new`]; file names come from
+///   `CONTEXT_FILE_NAMES` in the global config (default
+///   `[.goosehints, AGENTS.md]`).
+/// - `Some(names)`: only `names` are used, for the working directory up to the
+///   git root, the global config directory, and subdirectories
+///   ([`SystemPromptBuilder::with_hints`] and
+///   [`PromptManager::load_subdirectory_hints`]).
+/// - `Some(vec![])`: no context file is read.
+///
+/// `Config::global()` has no in-process override layer, so a host that owns the
+/// system prompt and lets the agent write to its working directory otherwise has
+/// no way to stop an agent-written `AGENTS.md` from becoming its next system
+/// prompt.
+```
+
+`ToolExecutionOperation::with_context_file_names`：
+
+```rust
+/// Restricts subdirectory hints loaded after tool calls to the file names chosen
+/// by the embedder (the same list as `AgentConfig::context_file_names`). `None`
+/// keeps today's behaviour; an empty list reads nothing.
+```
+
+`SubdirectoryHintTracker::with_context_filenames`：
+
+```rust
+/// Builds a tracker from context file names chosen by the embedder, without
+/// reading `CONTEXT_FILE_NAMES` from the global config.
+///
+/// The only difference from [`SubdirectoryHintTracker::new`] is where the file
+/// names come from. An empty list means no subdirectory ever yields hints.
+```
+
+测试辅助 `without_global_hints`（`prompt_manager.rs` 测试模块）：
+
+```rust
+/// Strips the global hints block (from `### Global Hints` up to `### Project Hints`).
+///
+/// The global block reads the process-wide `GOOSE_PATH_ROOT` / home, and
+/// `hints::load_hints::tests::test_global_agents_md_skipped_when_not_in_context_file_names`
+/// mutates `GOOSE_PATH_ROOT` with a bare `set_var` and no lock, so two reads in the
+/// same test can see different global blocks when tests run in parallel. The
+/// stripped block comes from the same `load_hint_files` call and the same file
+/// name list as the project block, so a wrong list still breaks the comparison.
+```
+
+📌 那条上游用例裸 `set_var` 不持锁本身是上游的测试隔离缺陷（实测让本 patch 的逐字节用例
+并行时偶发红，见上面变异表下的说明）。PR 里可以顺带提一句，⛔ 不在本 patch 里改它。
 
 ## 待回馈上游
 
@@ -546,6 +822,24 @@ resolver 2 在只编 lib 时**不做 dev-dep 的 feature 合一** ⇒ `cargo che
 工作树与 `855d73e4` 之间只差一个 docs 提交）；薄 patch `#1` 对 `bfbbf4463` 的相容性
 **未核**——归 bump 那一片，按上一节那张表逐条重跑。
 
+### 2026-09-23：`#2` 那次 rev bump **没有**合上游（登记，不是漏了）
+
+| 项 | 值 |
+|---|---|
+| 上游 HEAD（`git fetch upstream` 现读） | `201837dff`（2026-09-23 05:59 +0000，`fix(extensions): prevent Extension Manager from disabling itself (#12270)`），版本已到 `1.52.0` |
+| `git rev-list --left-right --count hasn...upstream/main`（打 `#2` 前） | `7  11` |
+| 本次 | `hasn` 只多了 `#2` 两笔（实现 ＋ 本文件登记），**一笔上游都没合** |
+
+理由：`#2` 是 `hasn-node` `K8-2`（放开写盘）之前必须先堵的口子，派工单把基点钉在 `f822c2276`；
+把 11 笔未审的上游（含一次 minor 版本跳）塞进同一次 rev bump，会让这一片的验收面
+从「一条 patch」扩成「一条 patch ＋ 一次上游同步」，而后者按上一节的表要逐条重跑。
+⇒ 上一节登记的「连同下一次 rev bump 一起合」**顺延到再下一次**，⛔ 不是作废。
+
+⚠️ 一条对下一次同步有用的现读：`upstream/main` 上读 hints 的三处仍是 `prompt_manager.rs:87`
+（`get_context_filenames()`）、`prompt_manager.rs:188`（`SubdirectoryHintTracker::new()`）、
+`ops_toolcalling.rs:778`（`SubdirectoryHintTracker::new()`），与 `#2` 打的位置一致 ⇒ 预计无文本冲突；
+**合完仍要按 `#2` 的最小性表重跑**，尤其「读 hints 的生产路径被穷举」那一行。
+
 ## 消费方
 
 `hasn-node` 经 cargo git 依赖消费本仓，`rev` 钉死、**不跟分支**：
@@ -559,8 +853,12 @@ goose-provider-types = { git = "https://github.com/youngshunf/goose.git", rev = 
 
 | `hasn-node` 分支 | 钉的 rev | 说明 |
 |---|---|---|
-| `main` | `af1e505e` | 建仓基线（RT-0） |
-| `feat/goose-k2b-session-id`、`feat/goose-k3-k4-prompt-and-retire` | `4f1b751c` | 带薄 patch `#1`，**未合回 main** |
+| `main` | `855d73e4` | 上游同步到 `96009644` ＋ 薄 patch `#1`（2026-09-23 现读 `main` 的 `modules/runtime-host/goose/Cargo.toml`） |
+| `feat/goose-k8-coding` | `hasn` 上 `#2` 登记那一笔（**即本文件随之提交的那一笔**，写不进自己的 SHA——现读该分支的 `Cargo.toml`） | 再加薄 patch `#2`（`K8-1b`），**未合回 main** |
+
+📌 **2026-09-23 订正**：本表原写 `main` 钉 `af1e505e`、`#1` 那两条分支钉 `4f1b751c`——
+那是 `K2b` 刚落地时的事实；此后 rev-bump 片已把 `main` 推到 `855d73e4`（含 `#1`），
+那两条分支在 `hasn-node` 已不存在（`git rev-parse --verify` 两条都查不到）。
 
 📌 **2026-09-22 订正**：本节原写 rev 是 `da0ee4c3…` 并标「现读」。`da0ee4c3` 确实是本仓一个真提交
 （同一条 K2b patch 的**被 rebase 掉的前身**，commit message 一字不差），但 `git grep da0ee4c3` 在
