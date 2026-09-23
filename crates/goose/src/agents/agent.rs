@@ -222,6 +222,10 @@ pub struct AgentConfig {
     pub session_name_update_tx: Option<mpsc::UnboundedSender<SessionNameUpdate>>,
     pub use_login_shell_path: Option<bool>,
     pub is_subagent: bool,
+    /// 嵌入方显式指定的上下文文件名（hints）。`None` ⇒ 读全局配置的 `CONTEXT_FILE_NAMES`
+    /// （原行为）；`Some(vec![])` ⇒ 一个 hints 文件都不读。见
+    /// [`AgentConfig::with_context_file_names`]。
+    pub context_file_names: Option<Vec<String>>,
 }
 
 impl AgentConfig {
@@ -246,7 +250,23 @@ impl AgentConfig {
             session_name_update_tx: None,
             use_login_shell_path: None,
             is_subagent: false,
+            context_file_names: None,
         }
+    }
+
+    /// 让**嵌入方显式指定**哪些文件名算「上下文文件」（hints），覆盖全局配置的
+    /// `CONTEXT_FILE_NAMES`。
+    ///
+    /// 同一张表管住内核读 hints 的全部三条路：每轮系统提示词里的工作目录 hints（向上到 git 根，
+    /// 含全局配置目录那几份）、经典循环里工具调用之后的子目录 hints、状态机里工具调用之后的
+    /// 子目录 hints。传空表 ⇒ 一个 hints 文件都不读。
+    ///
+    /// 不调用本方法 ⇒ 行为与之前逐字节相同（仍读全局配置）。
+    ///
+    /// ⚠️ 由 `summon` 派生的子 Agent 自建 `AgentConfig`，**不继承**本字段。
+    pub fn with_context_file_names(mut self, context_file_names: Vec<String>) -> Self {
+        self.context_file_names = Some(context_file_names);
+        self
     }
 
     pub fn with_mcp_host_info(mut self, mcp_host_info: Option<GooseMcpHostInfo>) -> Self {
@@ -429,6 +449,7 @@ impl Agent {
         let permission_manager = Arc::clone(&config.permission_manager);
         let use_login_shell_path = config.resolve_use_login_shell_path();
         let is_subagent = config.is_subagent;
+        let context_file_names = config.context_file_names.clone();
         Self {
             provider: provider.clone(),
             config,
@@ -442,7 +463,7 @@ impl Agent {
                 use_login_shell_path,
             )),
             final_output_tool: Arc::new(Mutex::new(None)),
-            prompt_manager: Mutex::new(PromptManager::new()),
+            prompt_manager: Mutex::new(PromptManager::with_context_file_names(context_file_names)),
             tool_confirmation_router: ToolConfirmationRouter::new(),
             tool_confirmation_coordinator: ToolConfirmationCoordinator::new(),
             retry_manager: RetryManager::new(),
@@ -1713,11 +1734,14 @@ impl Agent {
                 provider.clone(),
                 self.hook_manager.clone(),
             )),
-            Arc::new(ToolExecutionOperation::new(
-                &self.current_goose_mode,
-                self.extension_manager.clone(),
-                self.hook_manager.clone(),
-            )),
+            Arc::new(
+                ToolExecutionOperation::new(
+                    &self.current_goose_mode,
+                    self.extension_manager.clone(),
+                    self.hook_manager.clone(),
+                )
+                .with_context_file_names(self.config.context_file_names.clone()),
+            ),
             Arc::new(UnknownToolOperation::new(self.hook_manager.clone())),
             Arc::new(RetryOperation::new(
                 &self.goal,

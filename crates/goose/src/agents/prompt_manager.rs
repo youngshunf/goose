@@ -19,6 +19,8 @@ pub struct PromptManager {
     system_prompt_extras: IndexMap<String, String>,
     current_date_timestamp: String,
     subdirectory_hint_tracker: SubdirectoryHintTracker,
+    /// 嵌入方显式指定的上下文文件名。`None` ⇒ 读全局配置的 `CONTEXT_FILE_NAMES`（原行为）。
+    context_file_names: Option<Vec<String>>,
 }
 
 impl Default for PromptManager {
@@ -84,7 +86,11 @@ impl<'a> SystemPromptBuilder<'a, PromptManager> {
     }
 
     pub fn with_hints(mut self, working_dir: &Path) -> Self {
-        let hints_filenames = get_context_filenames();
+        let hints_filenames = self
+            .manager
+            .context_file_names
+            .clone()
+            .unwrap_or_else(get_context_filenames);
         let ignore_patterns = build_gitignore(working_dir);
 
         let hints = load_hint_files(working_dir, &hints_filenames, &ignore_patterns);
@@ -186,7 +192,30 @@ impl PromptManager {
             // Filtering to an hour to balance user time accuracy and multi session prompt cache hits.
             current_date_timestamp: Utc::now().format("%Y-%m-%d %H:00 %:z").to_string(),
             subdirectory_hint_tracker: SubdirectoryHintTracker::new(),
+            context_file_names: None,
         }
+    }
+
+    /// 让**嵌入方显式指定**哪些文件名算「上下文文件」（hints）。
+    ///
+    /// - `None` ⇒ 与 [`PromptManager::new`] 完全相同：文件名读全局配置的
+    ///   `CONTEXT_FILE_NAMES`，缺省 `[.goosehints, AGENTS.md]`；
+    /// - `Some(names)` ⇒ 文件名**只**取 `names`，全局配置的 `CONTEXT_FILE_NAMES` 不再生效；
+    ///   工作目录向上到 git 根、全局配置目录、子目录三条读路
+    ///   （[`SystemPromptBuilder::with_hints`] 与 [`PromptManager::load_subdirectory_hints`]）都用它；
+    /// - `Some(vec![])` ⇒ **一个 hints 文件都不读**。
+    ///
+    /// 为什么需要它：`Config::global()` 只有配置文件与环境变量两层，**没有进程内覆盖层**。
+    /// 把 goose 嵌进自己进程的宿主若自己持有系统提示词的权威，而 agent 又能写它的工作目录，
+    /// 那 agent 写下的一个 `AGENTS.md` 就会成为它自己下一轮的系统提示词。
+    pub fn with_context_file_names(context_file_names: Option<Vec<String>>) -> Self {
+        let mut manager = Self::new();
+        if let Some(names) = &context_file_names {
+            manager.subdirectory_hint_tracker =
+                SubdirectoryHintTracker::with_context_filenames(names.clone());
+        }
+        manager.context_file_names = context_file_names;
+        manager
     }
 
     #[cfg(test)]
@@ -196,6 +225,7 @@ impl PromptManager {
             system_prompt_extras: IndexMap::new(),
             current_date_timestamp: dt.format("%Y-%m-%d %H:%M:%S %:z").to_string(),
             subdirectory_hint_tracker: SubdirectoryHintTracker::new(),
+            context_file_names: None,
         }
     }
 
@@ -567,5 +597,172 @@ mod tests {
             .build();
 
         assert_snapshot!(system_prompt);
+    }
+
+    /// 唤星 `PATCHES.md` `#2` 的夹具：git 根里一份、工作目录里两份（其一带 `@引用`）、
+    /// 子目录一份。
+    fn context_file_layout() -> (tempfile::TempDir, std::path::PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        let work = project.join("work");
+        std::fs::create_dir_all(project.join(".git")).unwrap();
+        std::fs::create_dir_all(work.join("nested")).unwrap();
+        std::fs::write(
+            project.join(crate::hints::AGENTS_MD_FILENAME),
+            "PARENT_HINT",
+        )
+        .unwrap();
+        std::fs::write(
+            work.join(crate::hints::AGENTS_MD_FILENAME),
+            "ROOT_HINT\n@referenced.md",
+        )
+        .unwrap();
+        std::fs::write(work.join("referenced.md"), "REFERENCED_HINT").unwrap();
+        std::fs::write(
+            work.join(crate::hints::GOOSE_HINTS_FILENAME),
+            "GOOSEHINTS_HINT",
+        )
+        .unwrap();
+        std::fs::write(
+            work.join("nested").join(crate::hints::AGENTS_MD_FILENAME),
+            "NESTED_HINT",
+        )
+        .unwrap();
+        (temp, work)
+    }
+
+    fn nested_tool_arguments() -> Option<serde_json::Map<String, serde_json::Value>> {
+        serde_json::json!({ "path": "nested/file.rs" })
+            .as_object()
+            .cloned()
+    }
+
+    fn base_prompt_with_hints(manager: &PromptManager, working_dir: &Path) -> String {
+        manager
+            .builder()
+            .with_goose_mode(GooseMode::Auto)
+            .with_hints(working_dir)
+            .build()
+    }
+
+    /// 显式空表 ⇒ 工作目录（向上到 git 根、含 `@引用`）与子目录两条读路**一个 hints 都不读**：
+    /// 产出的 system prompt 与「根本没有 hints」逐字节相同。
+    #[test]
+    fn explicit_empty_context_file_names_read_no_hint_files() {
+        let (_temp, work) = context_file_layout();
+        let mut manager = PromptManager::with_context_file_names(Some(Vec::new()));
+        manager.set_system_prompt_override("BASE".to_string());
+
+        assert_eq!(base_prompt_with_hints(&manager, &work), "BASE");
+
+        manager.record_tool_arguments(&nested_tool_arguments(), &work);
+        assert!(
+            !manager.load_subdirectory_hints(&work),
+            "空表之下子目录跟踪器仍然读出了 hints"
+        );
+        assert_eq!(base_prompt_with_hints(&manager, &work), "BASE");
+    }
+
+    /// 显式非空表 ⇒ **只**认这张表，全局配置的缺省表（含 `AGENTS.md`）不再生效。
+    #[test]
+    fn explicit_context_file_names_replace_the_global_list() {
+        let (_temp, work) = context_file_layout();
+        let mut manager = PromptManager::with_context_file_names(Some(vec![
+            crate::hints::GOOSE_HINTS_FILENAME.to_string(),
+        ]));
+        manager.set_system_prompt_override("BASE".to_string());
+
+        let prompt = base_prompt_with_hints(&manager, &work);
+        assert!(prompt.contains("GOOSEHINTS_HINT"), "给定的文件名没被读到");
+        for absent in ["ROOT_HINT", "PARENT_HINT", "REFERENCED_HINT"] {
+            assert!(!prompt.contains(absent), "表外的文件 `{absent}` 进了提示词");
+        }
+
+        manager.record_tool_arguments(&nested_tool_arguments(), &work);
+        assert!(
+            !manager.load_subdirectory_hints(&work),
+            "子目录里只有表外的 AGENTS.md，却读出了 hints"
+        );
+    }
+
+    /// 剥掉全局 hints 块（`### Global Hints` 起、`### Project Hints` 止）。
+    ///
+    /// 全局块读的是**进程级**的 `GOOSE_PATH_ROOT` / home，而同一测试进程里的
+    /// `hints::load_hints::tests::test_global_agents_md_skipped_when_not_in_context_file_names`
+    /// 裸 `set_var` 改它、不持锁 ⇒ 并行时同一条用例前后两次读会读到不同的全局块（实测撞到过）。
+    /// 被剥掉的块与项目块出自同一次 `load_hint_files`、用的是同一张文件名表，
+    /// 文件名表一旦不同，项目块照样对不上。
+    fn without_global_hints(prompt: &str) -> String {
+        let Some((head, rest)) = prompt.split_once("\n### Global Hints\n") else {
+            return prompt.to_string();
+        };
+        match rest.split_once("### Project Hints") {
+            Some((_, project)) => format!("{head}### Project Hints{project}"),
+            None => prompt.to_string(),
+        }
+    }
+
+    /// `None` ⇒ 与改前**逐字节相同**（非真空对照）。
+    ///
+    /// 参照物照改前的代码逐步复原：文件名取 `get_context_filenames()`、经 `load_hint_files`
+    /// 读出并以 `hints` 为 key 追加；子目录那一支由 `SubdirectoryHintTracker::new()` 读出、
+    /// 以它自己的 key 进 extras。⛔ 参照物一步都不经过本 patch 改过的 `with_hints`。
+    /// 唯一的让步是比较前剥掉全局 hints 块，理由见 `without_global_hints`。
+    #[test]
+    fn unset_context_file_names_match_the_global_config_behaviour_byte_for_byte() {
+        let (_temp, work) = context_file_layout();
+        let root_hints = load_hint_files(&work, &get_context_filenames(), &build_gitignore(&work));
+        for present in [
+            "ROOT_HINT",
+            "PARENT_HINT",
+            "REFERENCED_HINT",
+            "GOOSEHINTS_HINT",
+        ] {
+            assert!(
+                root_hints.contains(present),
+                "非真空对照不成立：缺省行为本该读到 `{present}`"
+            );
+        }
+        let mut tracker = SubdirectoryHintTracker::new();
+        tracker.record_tool_arguments(&nested_tool_arguments(), &work);
+        let nested = tracker.load_new_hints(&work);
+        assert!(
+            nested
+                .iter()
+                .any(|(_, content)| content.contains("NESTED_HINT")),
+            "非真空对照不成立：缺省行为本该在工具调用后读到子目录 hints"
+        );
+
+        let mut reference = PromptManager::new();
+        reference.set_system_prompt_override("BASE".to_string());
+        let reference_prompt = |reference: &PromptManager| {
+            reference
+                .builder()
+                .with_goose_mode(GooseMode::Auto)
+                .with_prompt_extras([("hints".to_string(), root_hints.clone())])
+                .build()
+        };
+        let expected_before_tool = reference_prompt(&reference);
+        for (key, content) in nested {
+            reference.add_system_prompt_extra(key, content);
+        }
+        let expected_after_tool = reference_prompt(&reference);
+
+        for mut manager in [
+            PromptManager::new(),
+            PromptManager::with_context_file_names(None),
+        ] {
+            manager.set_system_prompt_override("BASE".to_string());
+            assert_eq!(
+                without_global_hints(&base_prompt_with_hints(&manager, &work)),
+                without_global_hints(&expected_before_tool)
+            );
+            manager.record_tool_arguments(&nested_tool_arguments(), &work);
+            assert!(manager.load_subdirectory_hints(&work));
+            assert_eq!(
+                without_global_hints(&base_prompt_with_hints(&manager, &work)),
+                without_global_hints(&expected_after_tool)
+            );
+        }
     }
 }

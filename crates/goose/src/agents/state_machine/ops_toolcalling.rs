@@ -316,6 +316,8 @@ pub struct ToolExecutionOperation<'a> {
     goose_mode: &'a Mutex<GooseMode>,
     extension_manager: Arc<ExtensionManager>,
     hook_manager: HookManager,
+    /// 嵌入方显式指定的上下文文件名。`None` ⇒ 读全局配置的 `CONTEXT_FILE_NAMES`（原行为）。
+    context_file_names: Option<Vec<String>>,
 }
 
 impl<'a> ToolExecutionOperation<'a> {
@@ -328,7 +330,15 @@ impl<'a> ToolExecutionOperation<'a> {
             goose_mode,
             extension_manager,
             hook_manager,
+            context_file_names: None,
         }
+    }
+
+    /// 让工具调用之后的子目录 hints 只认**嵌入方显式给定**的文件名
+    /// （与 `AgentConfig::context_file_names` 同一张表）。`None` ⇒ 原行为；空表 ⇒ 一个都不读。
+    pub fn with_context_file_names(mut self, context_file_names: Option<Vec<String>>) -> Self {
+        self.context_file_names = context_file_names;
+        self
     }
 
     async fn dispatch_tool_call(
@@ -775,7 +785,10 @@ impl Operation<Session, GooseEffect> for ToolExecutionOperation<'_> {
         session: &Session,
         conversation: &Conversation,
     ) -> Result<Vec<(String, String)>> {
-        let mut hints = SubdirectoryHintTracker::new();
+        let mut hints = match &self.context_file_names {
+            Some(names) => SubdirectoryHintTracker::with_context_filenames(names.clone()),
+            None => SubdirectoryHintTracker::new(),
+        };
         for message in conversation.messages() {
             for content in &message.content {
                 if let MessageContent::ToolRequest(request) = content {

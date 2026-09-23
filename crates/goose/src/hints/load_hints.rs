@@ -39,6 +39,18 @@ impl SubdirectoryHintTracker {
         }
     }
 
+    /// 用**嵌入方显式给定**的上下文文件名建跟踪器，⛔ 不读全局配置的 `CONTEXT_FILE_NAMES`。
+    ///
+    /// 与 [`SubdirectoryHintTracker::new`] 的唯一差别是文件名表从哪来。
+    /// 空表 ⇒ 任何子目录都不会产出 hints（`load_new_hints` 恒为空）。
+    pub fn with_context_filenames(hints_filenames: Vec<String>) -> Self {
+        Self {
+            loaded_dirs: HashSet::new(),
+            pending_dirs: Vec::new(),
+            hints_filenames,
+        }
+    }
+
     pub fn record_tool_arguments(
         &mut self,
         arguments: &Option<serde_json::Map<String, serde_json::Value>>,
