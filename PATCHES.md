@@ -89,7 +89,7 @@ git remote -v
 | 纯新增，一行未删 | `git diff upstream/main...hasn -- crates/goose/src/session/session_manager.rs --stat` | `166 insertions(+), 0 deletions(-)` |
 | 既有 `create_session` 的签名与函数体一字未动 | `git diff upstream/main...hasn -- crates/goose/src/session/session_manager.rs \| grep -c '^-[^-]'` | **`0`**（⚠️ 判据写成 `^-[^-]`，不是「没有以 `-` 开头的行」——`--- a/…` 那行就是以 `-` 开头的，照后者写会永远假红） |
 | 现有调用方零影响 | `git grep -n 'create_session(' upstream/main -- '*.rs' \| wc -l` 与同一条打在 `hasn` 上 | 打 patch 前 **129**，之后 **130**（📌 2026-09-22 随上游同步重测，原记的是 `124`/`125`，**差的是上游自己新增的调用点，不是我们的 patch 变胖了**——增量恒为 `+1`）。多的那一处是本 patch 自己那条非真空对照单测；**原有 129 处一处未改**。⚠️ 这个 grep **不会**匹配 `create_session_with_id(`（后者另有 5 处，全是新增）。⚠️ 判据写成 `git grep`，⛔ 别写 `grep -rn … .`：本机 `grep` 被 alias 到 `ugrep`，从父仓根递归时会**跳过全部子仓**（在本仓根跑恰好还对，换个 cwd 就静默给 0） |
-| 不动 schema / 不动迁移 | `git diff upstream/main...hasn --stat` | 只有 `session_manager.rs` 与 `PATCHES.md` 两个文件；`migrate_to_version` 的 `match` 分支一条未加 |
+| 不动 schema / 不动迁移 | `git diff upstream/main...hasn --stat` | 只有 `session_manager.rs` 与 `PATCHES.md` 两个文件；`migrate_to_version` 的 `match` 分支一条未加。📌 2026-09-23 起同一条命令还会列出 `#2` 的 6 个文件（见 `#2` 的表）——`#1` 这一格改看 `-- crates/goose/src/session/`，仍只有 `session_manager.rs` |
 | id 生成规则本身未动 | 单测 `create_session_still_generates_its_own_dated_id` | 非真空对照：既有 `create_session` 仍给出 `YYYYMMDD_1` |
 
 ### `#1` 的行为契约
