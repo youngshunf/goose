@@ -197,6 +197,53 @@ fn assert_terminal_error_block(
     );
 }
 
+struct EmptyStreamingProvider {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Provider for EmptyStreamingProvider {
+    fn get_name(&self) -> &str {
+        "empty-stream-provider"
+    }
+
+    fn retry_config(&self) -> goose_providers::retry::RetryConfig {
+        goose_providers::retry::RetryConfig {
+            max_retries: 0,
+            ..Default::default()
+        }
+    }
+
+    async fn stream(
+        &self,
+        _model_config: &ModelConfig,
+        _system: &str,
+        _messages: &[Message],
+        _tools: &[Tool],
+    ) -> std::result::Result<MessageStream, ProviderError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::pin(futures::stream::empty()))
+    }
+}
+
+/// 当前经典循环的 200 空轮另有固定重试，不受 provider 的零重试配置控制。
+#[tokio::test]
+async fn zero_retry_provider_still_replays_empty_successful_turn_in_classic_loop() -> Result<()> {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let provider = Arc::new(EmptyStreamingProvider {
+        calls: Arc::clone(&calls),
+    });
+    let (emitted, _) = reply_with_provider(provider, false).await?;
+    assert_eq!(calls.load(Ordering::SeqCst), 4);
+    assert!(
+        emitted
+            .iter()
+            .any(|message| message.as_concat_text().contains("empty")),
+        "经典空轮重试耗尽后没有显式反馈"
+    );
+    Ok(())
+}
+
 /// ⭐ 网络错误（relay 断连、重试耗尽）⇒ 两条循环都产出 `Error { kind: Other }`。
 #[tokio::test]
 async fn network_error_ends_the_turn_with_an_error_block() -> Result<()> {

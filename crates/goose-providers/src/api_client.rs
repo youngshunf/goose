@@ -32,6 +32,7 @@ pub struct ApiClient {
     tls_config: Option<TlsConfig>,
     request_builder: Option<RequestBuilderDecorator>,
     transport_policy: TransportPolicy,
+    no_transport_retry: bool,
 }
 
 #[derive(Clone)]
@@ -276,7 +277,7 @@ impl ApiClient {
         timeout: Duration,
         tls_config: Option<TlsConfig>,
     ) -> Result<Self> {
-        let mut client_builder = Self::client_builder(timeout);
+        let mut client_builder = Self::client_builder(timeout, false);
 
         if let Some(ref config) = tls_config {
             client_builder = Self::configure_tls(client_builder, config)?;
@@ -294,6 +295,7 @@ impl ApiClient {
             tls_config,
             request_builder: None,
             transport_policy: TransportPolicy::Default,
+            no_transport_retry: false,
         })
     }
 
@@ -311,15 +313,20 @@ impl ApiClient {
             .and_then(|value| value.to_str().ok())
     }
 
-    fn client_builder(timeout: Duration) -> reqwest::ClientBuilder {
-        Client::builder()
+    fn client_builder(timeout: Duration, no_transport_retry: bool) -> reqwest::ClientBuilder {
+        let builder = Client::builder()
             .connect_timeout(Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS))
-            .read_timeout(timeout)
+            .read_timeout(timeout);
+        if no_transport_retry {
+            builder.retry(reqwest::retry::never())
+        } else {
+            builder
+        }
     }
 
     fn rebuild_client(&mut self) -> Result<()> {
-        let mut client_builder =
-            Self::client_builder(self.timeout).default_headers(self.default_headers.clone());
+        let mut client_builder = Self::client_builder(self.timeout, self.no_transport_retry)
+            .default_headers(self.default_headers.clone());
         client_builder = Self::configure_transport(client_builder, &self.transport_policy);
 
         // Configure TLS if needed
@@ -440,6 +447,13 @@ impl ApiClient {
     pub fn with_auth(mut self, auth: AuthMethod) -> Self {
         self.auth = auth;
         self
+    }
+
+    /// 按实例禁用 reqwest 自带的协议 NACK 重试；后续重建客户端仍保留该设置。
+    pub fn with_no_transport_retry(mut self) -> Result<Self> {
+        self.no_transport_retry = true;
+        self.rebuild_client()?;
+        Ok(self)
     }
 
     pub fn with_https_only(mut self) -> Result<Self> {
@@ -875,6 +889,73 @@ mod tests {
                 "unexpected redirect error: {error:#}"
             );
         }
+    }
+
+    async fn protocol_nack_requests(no_transport_retry: bool, rebuild: bool) -> usize {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = Arc::clone(&requests);
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok(Ok((socket, _))) =
+                    tokio::time::timeout(Duration::from_millis(500), listener.accept()).await
+                else {
+                    break;
+                };
+                let observed = Arc::clone(&observed);
+                tokio::spawn(async move {
+                    let mut connection = h2::server::handshake(socket).await.unwrap();
+                    while let Some(Ok((request, mut respond))) = connection.accept().await {
+                        assert_eq!(request.method(), reqwest::Method::POST);
+                        assert_eq!(request.uri().path(), "/chat/completions");
+                        observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        respond.send_reset(h2::Reason::REFUSED_STREAM);
+                    }
+                });
+            }
+        });
+        let client =
+            ApiClient::new_with_tls(format!("http://{addr}"), AuthMethod::NoAuth, None).unwrap();
+        let client = if no_transport_retry {
+            client.with_no_transport_retry().unwrap()
+        } else {
+            client
+        };
+        let client = if rebuild {
+            client
+                .with_loopback_http_only()
+                .unwrap()
+                .with_header("x-client-test", "value")
+                .unwrap()
+        } else {
+            client
+        };
+        let client = ApiClient {
+            client: ApiClient::client_builder(client.timeout, client.no_transport_retry)
+                .no_proxy()
+                .http2_prior_knowledge()
+                .build()
+                .unwrap(),
+            ..client
+        };
+        let outcome = client
+            .request("chat/completions")
+            .response_post(&serde_json::json!({"model":"test-model"}))
+            .await;
+        assert!(
+            outcome.is_err(),
+            "REFUSED_STREAM 不能被当作成功：{outcome:?}"
+        );
+        server.await.unwrap();
+        requests.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn protocol_nack_retries_by_default_but_not_with_per_instance_policy() {
+        assert_eq!(protocol_nack_requests(false, false).await, 3);
+        assert_eq!(protocol_nack_requests(true, false).await, 1);
+        assert_eq!(protocol_nack_requests(true, true).await, 1);
     }
 
     #[tokio::test]

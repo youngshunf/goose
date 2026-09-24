@@ -86,6 +86,13 @@ relay 404 重试耗尽后，经典循环把 `ProviderError` 压成一条普通 a
 施工分支 `feat/provider-error-block`；worktree 为父仓根目录的
 `.worktrees/goose-fork-provider-error`；目标仓 `hasn-apps/goose`，主分支 `hasn`。
 
+### 2026-09-24：`#4` 施工登记
+
+施工分支 `feat/provider-no-retry`；worktree
+`/Users/mac/openclaw-workspace/huanxing/huanxing-project/.worktrees/goose-fork-provider-no-retry`；
+目标仓 `hasn-apps/goose`，目标主分支 `hasn`（起点 `88bd1ee1f306f78b81d26ea146a269a1a7b20c53`）。
+本片只改 fork，不合回 `hasn`、不推送；实现与证伪结果见下方 `#4` 登记。
+
 ## 改动登记
 
 | # | 改动点 | 类别 | 理由 | 上游回馈可能性 |
@@ -93,6 +100,7 @@ relay 404 重试耗尽后，经典循环把 `ProviderError` 压成一条普通 a
 | 1 | `crates/goose/src/session/session_manager.rs`：新增 `SessionManager::create_session_with_id` 与其存储层同名实现（**纯新增 166 行，0 删除**） | 内核逻辑（经 2026-09-22 单条裁决，见上） | 既有 `create_session` 的 id 是**在 SQL 里现算**的 `YYYYMMDD_N`，公开面上没有任何一条路能用调用方给的 id 建会话；而 `Agent::reply` 紧接着 `get_session(&session_config.id, true)`（`agents/agent.rs`），查不到就 `Err`。⇒ 嵌入 goose 的宿主（唤星 daemon 已有自己的 `RuntimeSessionId`）**无法让 `SessionConfig.id` 等于自己的会话身份**。另一条路（映射表）被 ADR E4 与施工文档 §2.7 同时挡死 | 🟢 **高**。让嵌入方自带 session id 是通用需求，与唤星业务零耦合。上游 PR 材料见下节，⚠️ 尚未提交（对外动作需主人授权） |
 | 2 | `crates/goose/src/agents/agent.rs`（`AgentConfig.context_file_names` ＋ `with_context_file_names`；`Agent::with_config` 与状态机装配各转交一次）、`agents/prompt_manager.rs`（`PromptManager::with_context_file_names`，`with_hints` 读它）、`agents/state_machine/ops_toolcalling.rs`（`ToolExecutionOperation::with_context_file_names`）、`hints/load_hints.rs`（`SubdirectoryHintTracker::with_context_filenames`）：**嵌入方显式指定上下文文件名**（**+483 / −8**，其中生产代码 **+86 / −8**、测试 +397；删除的 8 行全是 4 处被替换的原表达式，每处的 `None` 分支逐字就是原表达式） | 内核逻辑（经 2026-09-23 单条裁决，见上） | 内核读 hints 的三条路文件名表全部来自 `Config::global()`，**没有进程内覆盖层**；嵌入方持有系统提示词权威、agent 又能写工作根时，agent 写下的 `AGENTS.md` 就是它自己下一轮的系统提示词。环境变量与写全局配置两条路都给不出可判的保证 | 🟢 **高**。「嵌入方决定读哪些上下文文件」是通用需求，缺省行为逐字节不变，与唤星业务零耦合。上游 PR 材料见下节，⚠️ 尚未提交 |
 | 3 | `crates/goose/src/agents/agent.rs`：`ProviderError::NetworkError` 与通配 `Err(ref provider_err)` 两支在 `break` 前改用现成 `persist_and_push_message_with_id(…, Message::from_provider_error(provider_err))`，生产仅 **+16 / −10**；测试在 `agents/state_machine/tests/provider_errors_lifecycle.rs`，模块登记在 `tests/mod.rs` | 内核逻辑（本任务据零 fake 不变量实施，见上；不是新增的主人单条裁决） | relay 404 重试耗尽时普通 assistant 文本被嵌入方当 `Final`，派发假成功；身份验证错误与状态机路径已有 `Error` 块先例。只改两支调用、零新 API；不动拒答及 compact | 🟢 **高**。经典循环对齐已有状态机行为，不含唤星业务。上游 PR 材料见下节，⚠️ 尚未提交 |
+| 4 | `crates/goose-providers/src/openai_compatible.rs`：实例级 `with_retry_config(RetryConfig)` 覆写 `Provider::retry_config()`；`api_client.rs`：实例级 `with_no_transport_retry()` 在所有客户端重建时复施 reqwest `retry::never()`；测试覆盖 provider、真实本地 HTTP/SSE、真实 h2 NACK 与经典空轮反例 | 内核接入的窄公开挂点（本任务依据父仓 §2 非幂等 POST 不自动重放及 §1 零假回落；**没有**主人另行单条裁决） | 本地 relay chat POST 未见稳定去重键与服务端保证；缺省 provider 额外重试 3 次，Agent 首流项前可额外重发，reqwest 0.13.5 默认协议 NACK 还可重发 2 次。两处逐实例装配，其他 provider/默认实例保持原行为；⚠️ 经典 200 空轮和认证刷新仍有独立重发，故 #4 **不等于**全链零自动重放 | 🟢 **高**。通用嵌入方按实例选重试策略，默认零变化；见下方 PR 草稿，尚未向上游提交 |
 
 > 加一条 patch 就在上表加一行，**不要攒着**。评审判据是：
 > 这张表的行数 == `git diff upstream/main...hasn` 里非裁剪类改动的处数。
@@ -235,6 +243,45 @@ session::session_manager::tests::create_session`）：
 注入确定的错误以证伪消息类型，不冒称真实 relay 404 整链已验。** 真实 relay
 404 的端到端结局归 `hasn-node` 的真实 E2E 场景，依主人对 E2E 的单独授权执行；
 本片不运行。
+
+### `#4` 的最小性、证伪与仍未闭的入口
+
+- 只给 `OpenAiCompatibleProvider` 新增可选的实例配置，`new()` 的 `None` 仍走
+  `RetryConfig::default()`（`max_retries=3`）；`stream_payload` 原有 `with_retry` 与
+  `agents/reply_parts.rs` 首项读取都通过**同一个** `Provider::retry_config()` 取值，
+  它们的重试条件与退避实现一字未改；其他 provider 不变。`ApiClient` 默认建造不调用
+  `.retry()`，仍保留 reqwest 自带策略；仅调用 `with_no_transport_retry()` 的实例将
+  `.retry(reqwest::retry::never())` 装入 client，后续 `with_header` / transport policy
+  重建保持配置。**没有改变 `agents/agent.rs` 中 `#3` 两支或其它重试实现。**
+- 最小消费方式：`ApiClient::new_with_tls(...)?.with_loopback_http_only()?.with_no_transport_retry()?`，
+  再 `OpenAiCompatibleProvider::new(...).with_retry_config(RetryConfig { max_retries: 0, ..Default::default() })`。
+  ⛔ 两处必须同时装配，仅设置后者挡不住 reqwest 的 protocol NACK。
+- 测试先红后绿：`retry_policy_can_be_set_per_provider_without_changing_the_default`
+  先因无 `with_retry_config` 编译红（E0277/E0061，rc=101），落实例覆盖后
+  `3/0/3` 绿；真实 `TcpListener` 的 404/429/500 三种 `ProviderError` 均一次 POST，
+  真实 200 SSE 首解析项前 `ServerError` 经 `stream_response_from_provider` 仍一次 POST，
+  它证明 Agent 确实读到同一实例配置（不是只测 getter）。
+- reqwest 0.13.5 的 h2 `REFUSED_STREAM` 对照：**默认 3 次**（首次 + 协议 NACK 额外 2 次），
+  禁用实例 1 次，禁用后再 `with_loopback_http_only`/`with_header` 重建仍 1 次；
+  真 `h2::server::handshake` 监听、每次 POST 复位，测试增量只加 dev `h2`（已有锁定包）。
+  变异把**生产** `ApiClient::client_builder` 的分支改成 `if false && no_transport_retry`：
+  同一用例实际 3、期望 1，rc=101；恢复后 rc=0。测试客户端用同一生产 builder
+  追加 `.http2_prior_knowledge()` 才能在无 TLS 的真本地端口触发 h2，
+  不在测试代码复制 `.retry(never)`；生产装配未加 h2 的默认配置。
+- 307/308 的**边界对照不是跨仓证明**：本 fork 的真 loopback 响应无 `Location` 时
+  `ApiClient` 不跟随且只发一次；node 的生产 `passthrough.rs` 回程调用
+  `filter_response_for`，`headers.rs` 将 `location` 放在 `RESPONSE_STRIP` 且不在
+  `RESPONSE_ALLOW` 闭集里。**node 侧真出站回程是否逐次剥除的测试/变异由 node 施工方负责，
+  此处 not_run**；非 relay 用法若响应自带同源 Location，reqwest 仍可自动跟随
+  307/308，本 patch 不改变它的全局 redirect 策略。
+- 🔴 **仍未闭，不可宣称本地 relay 所有 POST 单次**：经典循环
+  `agents/agent.rs` 的 200 空应答 `MAX_EMPTY_TURN_RETRIES=3` 与 `retry_config()` 无关。
+  同组反例 `zero_retry_provider_still_replays_empty_successful_turn_in_classic_loop`
+  将 provider `max_retries=0` 并送入成功空 stream，`Agent::reply(false)` **调了 4 次**，
+  用例 rc=0，证明独立重放仍在；`ProviderRetry::with_retry_config` 遇到 401 且
+  `refresh_credentials()` 成功时同样可独立重发一次（`retry.rs:199-216`，
+  本片未做 Auth 成功刷新网络证据）。后两入口均由主会话另片判定/收口。
+  `hasn-node` 的真实 relay E2E 属于主会话，未经本片运行；本片没有合回 `hasn` 或 push。
 
 📌 影响面更宽的一轮 `cargo test -p goose --lib -- agents:: hints::`（跑在 `d628fd95f`，与 `70deb52a7` 只差一个测试辅助函数的写法——为过 clippy 的 `string_slice` 改成 `split_once`）：**624 passed / 1 failed**，
 红的是 `agents::prompt_manager::tests::test_all_platform_extensions`，**与 `#2` 无关**：
@@ -589,6 +636,68 @@ NetworkError, RequestFailed, and Authentication errors. Assert exactly one typed
 Error in emitted events, the expected kind and unchanged text, and persistence
 with user-visible / agent-invisible metadata. Before the change, the first two
 cases fail on the classic path while Authentication is a passing control.
+```
+
+### `#4` 的上游 PR 材料草稿（⚠️ 尚未提交）
+
+⛔ 只作本地材料，不向上游发送 issue/PR；按上游 `AGENTS.md`，对外 PR 须先链接
+Board 状态 **Ready** 的 issue。向上游提稿前把本仓新增的中文 doc comment/断言说明换成英文，
+仅摘取 `#4` 的差异，不混 `#1`～`#3`。本片的根据是本任务的非幂等与零假回落边界，
+**不虚构主人单独批准 `#4` 的裁决**。
+
+**issue 草稿**
+
+```text
+Title: Let embedded OpenAI-compatible providers disable retries per instance
+
+An embedding host may send non-idempotent chat/completions POSTs to a gateway
+without a deduplication contract. The OpenAI-compatible provider retries failed
+HTTP responses by default, the agent can retry a failure before its first stream
+item, and reqwest itself retries HTTP/2 protocol nacks. A host currently cannot
+turn off these retries for just one provider/client without changing defaults for
+all other users. Would you accept two additive opt-in builders: provider-level
+RetryConfig and ApiClient-level transport retry disablement? Unset keeps the
+existing behavior. Auth refresh and the classic loop's 200-empty-turn retry are
+separate concerns; this change deliberately does not claim to address them.
+```
+
+**PR 标题**
+
+```text
+feat(providers): allow embedders to disable retries per instance
+```
+
+**PR 正文草稿**
+
+```markdown
+### Problem
+
+OpenAI-compatible chat completions may be non-idempotent. Today the provider
+retries failed response statuses, the agent retries a transient error before
+its first stream item, and reqwest may replay an HTTP/2 protocol nack. An
+embedder has no per-instance option to disable all three for its local relay.
+
+### Change
+
+- `OpenAiCompatibleProvider::with_retry_config(RetryConfig)` overrides its
+  existing `Provider::retry_config()` source. Both provider send and agent
+  first-item processing already read that method; no retry algorithm changes.
+- `ApiClient::with_no_transport_retry()` opts this client into reqwest
+  `retry::never()` and preserves it through client rebuilds.
+- Neither builder affects an unconfigured instance or any other provider.
+
+### Verification and limits
+
+A real loopback listener sees one POST per 404/429/500 status and per transient
+in-stream failure before the first item. A real HTTP/2 listener sends
+REFUSED_STREAM; the default client makes three requests, the opt-in client one,
+even after a rebuild. Disabling the production retry branch fails that test
+(3 observed versus 1 expected). A 307/308 *without Location* does not redirect;
+this is a client-side conditional, not proof that any gateway strips Location.
+
+The classic agent loop still retries an HTTP 200 empty turn three times even
+with `max_retries=0` (four provider calls in a counterexample). Credential
+refresh after 401 is also independent. Neither behavior is claimed as solved.
 ```
 
 ## 待回馈上游

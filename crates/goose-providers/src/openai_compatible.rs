@@ -15,7 +15,7 @@ use tokio_util::io::StreamReader;
 
 use super::api_client::ApiClient;
 use super::base::{stream_from_single_message, MessageStream, Provider};
-use super::retry::ProviderRetry;
+use super::retry::{ProviderRetry, RetryConfig};
 use crate::conversation::message::Message;
 use crate::errors::ProviderError;
 use crate::formats::openai::{
@@ -35,6 +35,7 @@ pub struct OpenAiCompatibleProvider {
     /// Path prefix prepended to `chat/completions` (e.g. `"deployments/{name}/"` for Azure).
     completions_prefix: String,
     supports_streaming: bool,
+    retry_config: Option<RetryConfig>,
 }
 
 impl OpenAiCompatibleProvider {
@@ -44,11 +45,18 @@ impl OpenAiCompatibleProvider {
             api_client,
             completions_prefix,
             supports_streaming: true,
+            retry_config: None,
         }
     }
 
     pub fn with_supports_streaming(mut self, supports_streaming: bool) -> Self {
         self.supports_streaming = supports_streaming;
+        self
+    }
+
+    /// 按实例覆盖 provider 与 Agent 首个流 item 前共用的重试配置；未设置时保持缺省行为。
+    pub fn with_retry_config(mut self, retry_config: RetryConfig) -> Self {
+        self.retry_config = Some(retry_config);
         self
     }
 
@@ -171,6 +179,10 @@ impl OpenAiCompatibleProvider {
 impl Provider for OpenAiCompatibleProvider {
     fn get_name(&self) -> &str {
         &self.name
+    }
+
+    fn retry_config(&self) -> RetryConfig {
+        self.retry_config.clone().unwrap_or_default()
     }
 
     async fn refresh_credentials(&self) -> Result<(), ProviderError> {
@@ -360,6 +372,30 @@ mod tests {
     }
 
     #[test]
+    fn retry_policy_can_be_set_per_provider_without_changing_the_default() {
+        let client = || {
+            ApiClient::new_with_tls(
+                "http://localhost".to_string(),
+                crate::api_client::AuthMethod::NoAuth,
+                None,
+            )
+            .unwrap()
+        };
+        let default_provider =
+            OpenAiCompatibleProvider::new("default".to_string(), client(), String::new());
+        let no_retry_provider =
+            OpenAiCompatibleProvider::new("no-retry".to_string(), client(), String::new())
+                .with_retry_config(crate::retry::RetryConfig {
+                    max_retries: 0,
+                    ..Default::default()
+                });
+
+        assert_eq!(Provider::retry_config(&default_provider).max_retries, 3);
+        assert_eq!(Provider::retry_config(&no_retry_provider).max_retries, 0);
+        assert_eq!(Provider::retry_config(&default_provider).max_retries, 3);
+    }
+
+    #[test]
     fn build_request_respects_non_streaming_mode() {
         let provider = OpenAiCompatibleProvider::new(
             "test".to_string(),
@@ -380,6 +416,137 @@ mod tests {
 
         assert_eq!(payload.get("stream"), None);
         assert_eq!(payload.get("stream_options"), None);
+    }
+
+    #[tokio::test]
+    async fn zero_retry_provider_sends_one_post_for_http_errors() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        for (status, expected_kind) in [
+            ("404 Not Found", "request"),
+            ("429 Too Many Requests", "rate_limit"),
+            ("500 Internal Server Error", "server"),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let requests = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&requests);
+            let server = tokio::spawn(async move {
+                loop {
+                    let Ok(Ok((mut socket, _))) = tokio::time::timeout(
+                        std::time::Duration::from_millis(100),
+                        listener.accept(),
+                    )
+                    .await
+                    else {
+                        break;
+                    };
+                    let mut request = [0u8; 8192];
+                    let len = socket.read(&mut request).await.unwrap();
+                    assert!(
+                        request[..len].starts_with(b"POST /chat/completions HTTP/1.1"),
+                        "收到的不是预期请求：{:?}",
+                        String::from_utf8_lossy(&request[..len])
+                    );
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                    );
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                }
+            });
+            let client = ApiClient::new_with_tls(
+                format!("http://{addr}"),
+                crate::api_client::AuthMethod::NoAuth,
+                None,
+            )
+            .unwrap()
+            .with_loopback_http_only()
+            .unwrap()
+            .with_no_transport_retry()
+            .unwrap();
+            let provider = OpenAiCompatibleProvider::new("relay".into(), client, String::new())
+                .with_retry_config(RetryConfig {
+                    max_retries: 0,
+                    ..Default::default()
+                });
+            let error = match provider
+                .stream(&ModelConfig::new("test-model"), "", &[], &[])
+                .await
+            {
+                Ok(_) => panic!("{status} 应被识别为错误"),
+                Err(error) => error,
+            };
+            assert_eq!(error.telemetry_type(), expected_kind);
+            server.await.unwrap();
+            assert_eq!(requests.load(Ordering::SeqCst), 1, "{status} 被重发");
+        }
+    }
+
+    #[tokio::test]
+    async fn redirect_without_location_is_not_followed_by_api_client() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        for status in ["307 Temporary Redirect", "308 Permanent Redirect"] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let requests = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&requests);
+            let server = tokio::spawn(async move {
+                loop {
+                    let Ok(Ok((mut socket, _))) = tokio::time::timeout(
+                        std::time::Duration::from_millis(100),
+                        listener.accept(),
+                    )
+                    .await
+                    else {
+                        break;
+                    };
+                    let mut request = [0u8; 8192];
+                    let len = socket.read(&mut request).await.unwrap();
+                    assert!(request[..len].starts_with(b"POST /chat/completions HTTP/1.1"));
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                    );
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                }
+            });
+            let client = ApiClient::new_with_tls(
+                format!("http://{addr}"),
+                crate::api_client::AuthMethod::NoAuth,
+                None,
+            )
+            .unwrap()
+            .with_loopback_http_only()
+            .unwrap()
+            .with_no_transport_retry()
+            .unwrap();
+            let provider = OpenAiCompatibleProvider::new("relay".into(), client, String::new())
+                .with_retry_config(RetryConfig {
+                    max_retries: 0,
+                    ..Default::default()
+                });
+            let error = match provider
+                .stream(&ModelConfig::new("test-model"), "", &[], &[])
+                .await
+            {
+                Ok(_) => panic!("{status} 不应被当作成功"),
+                Err(error) => error,
+            };
+            assert!(
+                matches!(error, ProviderError::RequestFailed(_)),
+                "{error:?}"
+            );
+            server.await.unwrap();
+            assert_eq!(requests.load(Ordering::SeqCst), 1, "{status} 被重发");
+        }
     }
 
     #[tokio::test]

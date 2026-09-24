@@ -1978,6 +1978,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn zero_retry_openai_provider_does_not_resend_before_first_stream_item() {
+        use goose_providers::api_client::{ApiClient, AuthMethod};
+        use goose_providers::openai_compatible::OpenAiCompatibleProvider;
+        use goose_providers::retry::RetryConfig;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let received = Arc::clone(&calls);
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok(Ok((mut socket, _))) =
+                    tokio::time::timeout(Duration::from_millis(200), listener.accept()).await
+                else {
+                    break;
+                };
+                let mut request = [0u8; 8192];
+                let len = socket.read(&mut request).await.unwrap();
+                assert!(request[..len].starts_with(b"POST /chat/completions HTTP/1.1"));
+                received.fetch_add(1, Ordering::SeqCst);
+                socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\ndata: {\"error\":{\"message\":\"stream interrupted\"}}\n\n",
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let client = ApiClient::new_with_tls(format!("http://{addr}"), AuthMethod::NoAuth, None)
+            .unwrap()
+            .with_loopback_http_only()
+            .unwrap()
+            .with_no_transport_retry()
+            .unwrap();
+        let provider = OpenAiCompatibleProvider::new("relay".into(), client, String::new())
+            .with_retry_config(RetryConfig {
+                max_retries: 0,
+                ..Default::default()
+            });
+        assert_eq!(Provider::retry_config(&provider).max_retries, 0);
+        let mut stream = stream_for_test(Arc::new(provider)).await;
+        assert!(matches!(
+            stream.next().await.unwrap(),
+            Err(ProviderError::ServerError(ref message)) if message == "stream interrupted"
+        ));
+        server.await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn first_item_transient_error_retries() {
         let provider = Arc::new(SequencedProvider::new(vec![
             Ok(vec![Err(transient_error())]),
