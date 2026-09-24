@@ -3266,11 +3266,14 @@ impl Agent {
                             #[cfg(feature = "telemetry")]
                             crate::posthog::emit_error(provider_err.telemetry_type(), &provider_err.to_string());
                             error!("Error: {}", provider_err);
-                            yield AgentEvent::Message(
-                                Message::assistant().with_text(
-                                    format!("{provider_err}\n\nPlease resend your message to try again.")
-                                )
-                            );
+                            let message = persist_and_push_message_with_id(
+                                &session_manager,
+                                &session_config.id,
+                                &mut conversation,
+                                Message::from_provider_error(provider_err),
+                            )
+                            .await?;
+                            yield AgentEvent::Message(message);
                             break;
                         }
                         Err(ref provider_err) => {
@@ -3278,11 +3281,14 @@ impl Agent {
                             #[cfg(feature = "telemetry")]
                             crate::posthog::emit_error(provider_err.telemetry_type(), &provider_err.to_string());
                             error!("Error: {}", provider_err);
-                            yield AgentEvent::Message(
-                                Message::assistant().with_text(
-                                    format!("Ran into this error: {provider_err}.\n\nPlease retry if you think this is a transient or recoverable error.")
-                                )
-                            );
+                            let message = persist_and_push_message_with_id(
+                                &session_manager,
+                                &session_config.id,
+                                &mut conversation,
+                                Message::from_provider_error(provider_err),
+                            )
+                            .await?;
+                            yield AgentEvent::Message(message);
                             break;
                         }
                     }

@@ -15,6 +15,7 @@ mod dummy_api;
 mod hooks_lifecycle;
 mod pipeline;
 mod prompt_skill_lifecycle;
+mod provider_errors_lifecycle;
 mod provider_lifecycle;
 mod recipe_scheduling_lifecycle;
 mod reconstruction_isolation_lifecycle;

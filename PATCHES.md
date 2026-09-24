@@ -72,12 +72,27 @@ git remote -v
 ⛔ **这条裁决只覆盖 `#2` 这一条。** 第三条内核逻辑 patch 仍要单独裁决，
 ⛔ 不得引用本段或上一段当作「内核逻辑可以改了」。
 
+### 2026-09-23：本任务按零 fake 不变量实施内核逻辑薄 patch（`#3`），⛔ 不构成放宽
+
+`#3` 由 `hasn-node` LLM 线的本机 E2E 提出，本任务的实施范围只覆盖 provider 终态错误。
+relay 404 重试耗尽后，经典循环把 `ProviderError` 压成一条普通 assistant 文本再 `break`；
+嵌入方只能读到正常 `Final`，派发被记成 `succeeded`。这违反「故障显式进入 UI 或日志，
+不得用正常产出掩盖失败」。上游已有 `Message::from_provider_error` 与
+`persist_and_push_message_with_id`：`Authentication` 分支及状态机路径已用它们产出带 kind
+的 `Error` 块，而 `NetworkError` 与通配错误分支未用。只把这两支改成同形，零新 API，
+不动拒答、压缩及消息转换函数。⛔ **这次实施仅覆盖 `#3`**，不得外推为允许修改其他内核逻辑；
+未发生主人另行批准 `#3` 的单独裁决。
+
+施工分支 `feat/provider-error-block`；worktree 为父仓根目录的
+`.worktrees/goose-fork-provider-error`；目标仓 `hasn-apps/goose`，主分支 `hasn`。
+
 ## 改动登记
 
 | # | 改动点 | 类别 | 理由 | 上游回馈可能性 |
 |---|---|---|---|---|
 | 1 | `crates/goose/src/session/session_manager.rs`：新增 `SessionManager::create_session_with_id` 与其存储层同名实现（**纯新增 166 行，0 删除**） | 内核逻辑（经 2026-09-22 单条裁决，见上） | 既有 `create_session` 的 id 是**在 SQL 里现算**的 `YYYYMMDD_N`，公开面上没有任何一条路能用调用方给的 id 建会话；而 `Agent::reply` 紧接着 `get_session(&session_config.id, true)`（`agents/agent.rs`），查不到就 `Err`。⇒ 嵌入 goose 的宿主（唤星 daemon 已有自己的 `RuntimeSessionId`）**无法让 `SessionConfig.id` 等于自己的会话身份**。另一条路（映射表）被 ADR E4 与施工文档 §2.7 同时挡死 | 🟢 **高**。让嵌入方自带 session id 是通用需求，与唤星业务零耦合。上游 PR 材料见下节，⚠️ 尚未提交（对外动作需主人授权） |
 | 2 | `crates/goose/src/agents/agent.rs`（`AgentConfig.context_file_names` ＋ `with_context_file_names`；`Agent::with_config` 与状态机装配各转交一次）、`agents/prompt_manager.rs`（`PromptManager::with_context_file_names`，`with_hints` 读它）、`agents/state_machine/ops_toolcalling.rs`（`ToolExecutionOperation::with_context_file_names`）、`hints/load_hints.rs`（`SubdirectoryHintTracker::with_context_filenames`）：**嵌入方显式指定上下文文件名**（**+483 / −8**，其中生产代码 **+86 / −8**、测试 +397；删除的 8 行全是 4 处被替换的原表达式，每处的 `None` 分支逐字就是原表达式） | 内核逻辑（经 2026-09-23 单条裁决，见上） | 内核读 hints 的三条路文件名表全部来自 `Config::global()`，**没有进程内覆盖层**；嵌入方持有系统提示词权威、agent 又能写工作根时，agent 写下的 `AGENTS.md` 就是它自己下一轮的系统提示词。环境变量与写全局配置两条路都给不出可判的保证 | 🟢 **高**。「嵌入方决定读哪些上下文文件」是通用需求，缺省行为逐字节不变，与唤星业务零耦合。上游 PR 材料见下节，⚠️ 尚未提交 |
+| 3 | `crates/goose/src/agents/agent.rs`：`ProviderError::NetworkError` 与通配 `Err(ref provider_err)` 两支在 `break` 前改用现成 `persist_and_push_message_with_id(…, Message::from_provider_error(provider_err))`，生产仅 **+16 / −10**；测试在 `agents/state_machine/tests/provider_errors_lifecycle.rs`，模块登记在 `tests/mod.rs` | 内核逻辑（本任务据零 fake 不变量实施，见上；不是新增的主人单条裁决） | relay 404 重试耗尽时普通 assistant 文本被嵌入方当 `Final`，派发假成功；身份验证错误与状态机路径已有 `Error` 块先例。只改两支调用、零新 API；不动拒答及 compact | 🟢 **高**。经典循环对齐已有状态机行为，不含唤星业务。上游 PR 材料见下节，⚠️ 尚未提交 |
 
 > 加一条 patch 就在上表加一行，**不要攒着**。评审判据是：
 > 这张表的行数 == `git diff upstream/main...hasn` 里非裁剪类改动的处数。
@@ -181,6 +196,45 @@ session::session_manager::tests::create_session`）：
 ⛔ 没有改上游那条用例。修后原样连跑 4 次全绿，FM4 在修后的用例上复验仍红（上表 FM4 行即修后结果）。
 ⚠️ FM1–FM3、FM5 跑在修竞态之前的那一版（`0c67aa76f`，未推送、已被 amend 掉）上；
 它们各自红的那几条（两条单测与两循环用例）在两版之间**一字未变**，变的只有逐字节用例的比较方式。
+
+### `#3` 的最小性与行为契约
+
+- **最小性**：以 `8f1ef1db1` 为基点，生产只改 `agents/agent.rs` 的
+  `NetworkError` 与通配 `Err(ref provider_err)` 两支（**+16 / −10**）；沿用
+  `Authentication` 原有的 `persist_and_push_message_with_id` 与
+  `Message::from_provider_error`。零新 API、零字段、零依赖；`Refusal`、
+  `ContextLengthExceeded` 的自动压缩及 `from_provider_error` 本体**一字未动**。
+  两支能在相同作用域访问 `session_manager`、`session_config.id` 和可变 `conversation`；
+  `Authentication` 相邻分支现成编译、测试通过的调用形状就是非真空对照。
+- **行为**：错误之后仍 `break`；事件流有一个 `MessageContentBlock::Error`，
+  `MessageErrorKind::Other`（`NetworkError` / `RequestFailed` 在现有映射里均是 `Other`），
+  消息逐字落会话且主人可见、下一轮模型不可见；人看的正文仍逐字等于改前两支。
+  认证失败维持 `Authentication` kind。状态机路径原已走同一个转换函数，
+  不改它的生产代码，但同组测试经两条 `Agent::reply` 路都核类型和落库。
+- **不在本片**：`ProviderError::Refusal`、compaction、空回答和 max turns 仍可能
+  不带 `Error` 块（原 `F-1` 余项）；非幂等 LLM POST 的重试与去重策略另片处理，
+  此处只修**重试耗尽之后的错误载体**。
+- 🔴 **剩余的非幂等重放缺口**：`goose-providers/src/openai_compatible.rs::stream_payload`
+  将 `response_post(&payload)` + `handle_status` 放进 `with_retry`；HTTP 404 经
+  `http_status.rs` 映成 `ProviderError::RequestFailed`，`RetryConfig::default()` 允许
+  至多 3 次**额外**重放。它在 `Provider::stream()` 返回前发生，**不等于**
+  `agents/reply_parts.rs` 只在首包错误时启用的另一层 `transient_only` 重试；
+  空应答又有独立的 agent loop 重试。未见 NewAPI chat 的稳定去重键与服务端
+  去重合同凭据；`#3` 不调整任何一层重试，也不宣称零重放，另片收口。
+
+### `#3` 的红绿与变异
+
+`cargo test -p goose --lib -- provider_errors_lifecycle`：先在生产代码未改时编译跑
+`network_error_ends_the_turn_with_an_error_block`、
+`other_provider_error_ends_the_turn_with_an_error_block`、
+`authentication_error_ends_the_turn_with_an_error_block`：前两条各因
+`state_machine=false` 收到普通 `Text`、Error 块数 `0` 而**红**（rc=101），
+认证对照 **绿**。两支改完同一组 3 条 **全绿**（rc=0）。这是对旧代码的
+反事实变异：取消两支的改动，恢复原有的 `Message::assistant().with_text(...)`
+会被事件流断言抓住，且失败正文指向改动处。**测试夹具只向 `Provider::stream`
+注入确定的错误以证伪消息类型，不冒称真实 relay 404 整链已验。** 真实 relay
+404 的端到端结局归 `hasn-node` 的真实 E2E 场景，依主人对 E2E 的单独授权执行；
+本片不运行。
 
 📌 影响面更宽的一轮 `cargo test -p goose --lib -- agents:: hints::`（跑在 `d628fd95f`，与 `70deb52a7` 只差一个测试辅助函数的写法——为过 clippy 的 `string_slice` 改成 `split_once`）：**624 passed / 1 failed**，
 红的是 `agents::prompt_manager::tests::test_all_platform_extensions`，**与 `#2` 无关**：
@@ -482,13 +536,69 @@ Both agent loops are covered.
 📌 那条上游用例裸 `set_var` 不持锁本身是上游的测试隔离缺陷（实测让本 patch 的逐字节用例
 并行时偶发红，见上面变异表下的说明）。PR 里可以顺带提一句，⛔ 不在本 patch 里改它。
 
+### `#3` 的上游 PR 材料草稿（⚠️ 尚未提交）
+
+⛔ 此处只是草稿：**没有向上游提 issue 或 PR**；对外动作仍需主人另行授权，
+还须按上游 `AGENTS.md` 的 Board **Ready** issue 流程。向上游提交时把本仓
+中文测试说明与断言文本改成英文；只摘取本条差异，不混入 `#1`、`#2`。
+
+**目标仓**：`aaif-goose/goose`　**类型**：bug fix　**范围**：经典循环两条分支 + 双循环回归
+
+**issue 标题与正文草稿**
+
+```text
+Title: Legacy agent loop reports terminal provider errors as successful assistant text
+
+When the legacy Agent::reply loop receives a NetworkError or another provider
+error after retries are exhausted, it yields a plain assistant text message
+and ends the turn. Embedders cannot distinguish that from a successful answer
+without matching prose. Authentication errors already use a typed Error block;
+the state-machine path uses Message::from_provider_error for provider errors.
+Could we align the two legacy branches with these existing paths while keeping
+their user-facing message text unchanged?
+```
+
+**PR 标题**
+
+```text
+fix(agents): emit typed Error blocks for terminal provider errors
+```
+
+**PR 正文草稿**
+
+```markdown
+### Problem
+
+The legacy loop emits plain assistant text for `NetworkError` and its catch-all
+provider-error branch, then breaks. Embedders observe a successful-looking
+message even when no model answer was produced. The adjacent Authentication
+branch and the state-machine inference path already emit typed Error content.
+
+### Change
+
+In the two legacy branches, use the existing `persist_and_push_message_with_id`
+with `Message::from_provider_error`. This preserves the exact existing text for
+both errors while exposing `MessageErrorKind::Other` to consumers and persisting
+the message consistently with Authentication. No new API or message variant;
+refusal, compaction, and provider retry policy are unchanged.
+
+### Verification
+
+Drive `Agent::reply` through both classic and state-machine paths with injected
+NetworkError, RequestFailed, and Authentication errors. Assert exactly one typed
+Error in emitted events, the expected kind and unchanged text, and persistence
+with user-visible / agent-invisible metadata. Before the change, the first two
+cases fail on the classic path while Authentication is a passing control.
+```
+
 ## 待回馈上游
 
 > ⚠️ 本节与上面那节**不是一回事**：上面那节是「我们已经打了 patch，材料备好等授权提 PR」；
-> 本节是「**我们没打 patch**，而是希望上游加一个能力／修一个 bug」。
+> 本节是「**对应公开面还没打 patch**，而是希望上游加一个能力／修一个 bug」。
+> `F-1` 原登记里的 provider 终态错误一半已由 `#3` 修补；余下的终局类型信号未补。
 > ⛔ 本节任何一条都**还没有**向上游提过 issue 或 PR——对外动作要主人授权。
 >
-> **为什么不自己打 patch**：这两条动的都是**上游的公开面**（一个公开枚举、一个 Cargo
+> **为什么不自己打公开面 patch**：其中两条动的是**上游的公开面**（一个公开枚举、一个 Cargo
 > feature 声明）。薄 patch 纪律逐字「内核逻辑非改不可时**优先回馈上游**」，
 > 而公开面的改动尤其要先跟上游谈——悄悄改一个公开枚举，每次 rebase 都要重打，
 > 且上游哪天自己加了一个形状不同的等价物就变成两套。
@@ -497,6 +607,11 @@ Both agent loops are covered.
 
 **登记方**：唤星 `K5`（`hasn-node` `modules/runtime-host/goose/src/events.rs`，2026-09-22）。
 **现读基线**：fork `hasn` 分支 `4f1b751c`（= 上游 `5e909259` + 我们的 `#1`）。
+📌 上句是 **F-1 原登记时的历史基线**，不是 `#3` 的施工基点（`8f1ef1db1`）。
+`#3` 已覆盖 F-1 同族中「`NetworkError` 与通配 provider 终态错误压成普通英文正文」
+这一半：经典循环现在也发 `MessageContentBlock::Error`；`Authentication` 原本就发。
+⛔ **尚未覆盖**：`InlineMessage` 里的压缩后终局、`MAX_TURNS`、空应答重试耗尽、
+`Refusal` 等原因的类型化终局；下述原表是这些剩余问题的历史登记，仍待上游。
 
 #### 现象
 
