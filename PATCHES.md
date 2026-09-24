@@ -93,6 +93,14 @@ relay 404 重试耗尽后，经典循环把 `ProviderError` 压成一条普通 a
 目标仓 `hasn-apps/goose`，目标主分支 `hasn`（起点 `88bd1ee1f306f78b81d26ea146a269a1a7b20c53`）。
 本片只改 fork，不合回 `hasn`、不推送；实现与证伪结果见下方 `#4` 登记。
 
+### 2026-09-24：`#5` 施工登记
+
+施工分支 `feat/provider-empty-turn-no-replay`；worktree
+`/Users/mac/openclaw-workspace/huanxing/huanxing-project/.worktrees/goose-fork-empty-turn`；
+目标仓 `hasn-apps/goose`，目标主分支 `hasn`（起点 `42e3bc09b6061ea398e92bfe12cebe1153bd82e6`）。
+本片只改 fork，不合回 `hasn`、不推送；依据父仓 §2 非幂等调用及 §1 零 fake 铁律，
+不记作主人单独批准。
+
 ## 改动登记
 
 | # | 改动点 | 类别 | 理由 | 上游回馈可能性 |
@@ -101,6 +109,7 @@ relay 404 重试耗尽后，经典循环把 `ProviderError` 压成一条普通 a
 | 2 | `crates/goose/src/agents/agent.rs`（`AgentConfig.context_file_names` ＋ `with_context_file_names`；`Agent::with_config` 与状态机装配各转交一次）、`agents/prompt_manager.rs`（`PromptManager::with_context_file_names`，`with_hints` 读它）、`agents/state_machine/ops_toolcalling.rs`（`ToolExecutionOperation::with_context_file_names`）、`hints/load_hints.rs`（`SubdirectoryHintTracker::with_context_filenames`）：**嵌入方显式指定上下文文件名**（**+483 / −8**，其中生产代码 **+86 / −8**、测试 +397；删除的 8 行全是 4 处被替换的原表达式，每处的 `None` 分支逐字就是原表达式） | 内核逻辑（经 2026-09-23 单条裁决，见上） | 内核读 hints 的三条路文件名表全部来自 `Config::global()`，**没有进程内覆盖层**；嵌入方持有系统提示词权威、agent 又能写工作根时，agent 写下的 `AGENTS.md` 就是它自己下一轮的系统提示词。环境变量与写全局配置两条路都给不出可判的保证 | 🟢 **高**。「嵌入方决定读哪些上下文文件」是通用需求，缺省行为逐字节不变，与唤星业务零耦合。上游 PR 材料见下节，⚠️ 尚未提交 |
 | 3 | `crates/goose/src/agents/agent.rs`：`ProviderError::NetworkError` 与通配 `Err(ref provider_err)` 两支在 `break` 前改用现成 `persist_and_push_message_with_id(…, Message::from_provider_error(provider_err))`，生产仅 **+16 / −10**；测试在 `agents/state_machine/tests/provider_errors_lifecycle.rs`，模块登记在 `tests/mod.rs` | 内核逻辑（本任务据零 fake 不变量实施，见上；不是新增的主人单条裁决） | relay 404 重试耗尽时普通 assistant 文本被嵌入方当 `Final`，派发假成功；身份验证错误与状态机路径已有 `Error` 块先例。只改两支调用、零新 API；不动拒答及 compact | 🟢 **高**。经典循环对齐已有状态机行为，不含唤星业务。上游 PR 材料见下节，⚠️ 尚未提交 |
 | 4 | `crates/goose-providers/src/openai_compatible.rs`：实例级 `with_retry_config(RetryConfig)` 覆写 `Provider::retry_config()`；`api_client.rs`：实例级 `with_no_transport_retry()` 在所有客户端重建时复施 reqwest `retry::never()`；测试覆盖 provider、真实本地 HTTP/SSE、真实 h2 NACK 与经典空轮反例 | 内核接入的窄公开挂点（本任务依据父仓 §2 非幂等 POST 不自动重放及 §1 零假回落；**没有**主人另行单条裁决） | 本地 relay chat POST 未见稳定去重键与服务端保证；缺省 provider 额外重试 3 次，Agent 首流项前可额外重发，reqwest 0.13.5 默认协议 NACK 还可重发 2 次。两处逐实例装配，其他 provider/默认实例保持原行为；⚠️ 经典 200 空轮和认证刷新仍有独立重发，故 #4 **不等于**全链零自动重放 | 🟢 **高**。通用嵌入方按实例选重试策略，默认零变化；见下方 PR 草稿，尚未向上游提交 |
+| 5 | `crates/goose/src/agents/agent.rs`：只在经典循环 `RetryResult::Skipped` 的空轮分支检查现有 `provider.retry_config().max_retries == 0`；首次空轮即通过既有 `persist_and_push_message_with_id` 发出并保存 `Message::assistant().with_error(MessageErrorKind::Other, EMPTY_TURN_MESSAGE)`，不再调用第二次 `Provider::stream`；原 #4 反例翻面并增默认及状态机对照 | 内核逻辑（据父仓 §2 非幂等 POST 不重发及 §1 零 fake 实施，**没有**主人另行单条裁决） | 200 成功空轮也是已发送的非幂等请求；零重试实例原额外发 3 次，且普通 assistant 文本被当正常答复。现闭集里 `Authentication`、`ContextLengthExceeded`、`CreditsExhausted` 均与事实不符，因此取 `Other`；`with_error` 为主人可见、模型不可见，错误在事件流和会话中均可判 | 🟢 **高**。与宿主业务无关，复用现有配置和错误消息接口；上游 PR 仅备材料，尚未对外提交 |
 
 > 加一条 patch 就在上表加一行，**不要攒着**。评审判据是：
 > 这张表的行数 == `git diff upstream/main...hasn` 里非裁剪类改动的处数。
@@ -282,6 +291,38 @@ session::session_manager::tests::create_session`）：
   `refresh_credentials()` 成功时同样可独立重发一次（`retry.rs:199-216`，
   本片未做 Auth 成功刷新网络证据）。后两入口均由主会话另片判定/收口。
   `hasn-node` 的真实 relay E2E 属于主会话，未经本片运行；本片没有合回 `hasn` 或 push。
+
+### `#5` 的最小性、行为与证伪
+
+- 生产只改 `agents/agent.rs` 的一个空轮分支及 `MessageErrorKind` import，零新类型、
+  零新 retry 配置、零其它重试分支；只有 `RetryResult::Skipped && empty_response` 且
+  `Provider::retry_config().max_retries == 0` 才提前报 `Other` 错误并结束。保留原
+  `EMPTY_TURN_MESSAGE` 的人类正文；不把普通 assistant `Text` 当失败载体。
+  `MessageErrorKind` 现有闭集没有 EmptyResponse：此处不是认证、额度或上下文超限，
+  因此只能选 `Other`。现成 `with_error` 设定主人可见、模型不可见；
+  `persist_and_push_message_with_id` 同步落会话与内存消息，事件流也发该条消息。
+- **范围边界**：默认 provider（`max_retries=3`）经典循环仍按固定
+  `MAX_EMPTY_TURN_RETRIES=3` 发 **1+3** 次、保留原普通文本；recipe retry
+  和 goal/grind 分支未动。状态机原只发一次，生产一字未动，用例锁住它。
+  ⚠️ **仍未闭**：默认/其他非零配置的 Provider 自动重试仍在；401 成功
+  `refresh_credentials()` 后是否补发（`goose-provider-types/src/retry.rs`）尚未收口。
+  本片不能宣称所有 relay POST 都不重发；node 侧真 relay E2E 未运行。
+- **先红后绿**：将 `#4` 的反例改为
+  `zero_retry_provider_ends_empty_successful_turn_with_error_without_replay`，直接走
+  `Agent::reply(false)`；旧代码成功编译、实际跑 **1 条** 后 stream 调用 **4≠1**
+  而红（rc=101），不是 `--exact` 筛空 0 条（第一次误用 `--exact` 得 rc=0、
+  `0 passed`，已明确作废）。修后同文件 6 条用例 rc=0：零配置 1 次、事件流恰
+  1 个 `Error { kind: Other }` 且文案不变、纯文本 Final 消失、会话落库且主人可见
+  模型不可见；默认经典 4 次及既有普通文本；状态机 1 次及既有普通文本；
+  `#3` 的三种 provider 终态错误仍绿。
+- **旧 #4 登记的时间口径**：上节 `#4` 的「仍未闭」及其 PR 草稿是
+  `#4` 施工当时的证据，不能再当本分支现状；该空轮缺口现由 `#5` **只对零配置**闭合。
+  默认/其他非零配置的空轮重放和认证刷新仍按上述边界保留。
+- **变异**：仅把新判定 `== 0` 临时旁路为 `== usize::MAX`，同一零配置用例
+  在真实运行中再次 **4≠1**、rc=101；还原源码再跑同文件 6 条，rc=0。
+  `cargo fmt --all -- --check`、`cargo clippy -p goose --lib --tests -- -D warnings`
+  与 `git diff --check` 均 rc=0，Clippy 输出包含 `Checking goose v1.51.0`。
+  未运行全量 gate/E2E，也未合主 clone 或 push。
 
 📌 影响面更宽的一轮 `cargo test -p goose --lib -- agents:: hints::`（跑在 `d628fd95f`，与 `70deb52a7` 只差一个测试辅助函数的写法——为过 clippy 的 `string_slice` 改成 `split_once`）：**624 passed / 1 failed**，
 红的是 `agents::prompt_manager::tests::test_all_platform_extensions`，**与 `#2` 无关**：
@@ -698,6 +739,63 @@ this is a client-side conditional, not proof that any gateway strips Location.
 The classic agent loop still retries an HTTP 200 empty turn three times even
 with `max_retries=0` (four provider calls in a counterexample). Credential
 refresh after 401 is also independent. Neither behavior is claimed as solved.
+```
+
+### `#5` 的上游 PR 材料草稿（⚠️ 尚未提交）
+
+⛔ 只备本地材料，不对外发送 issue 或 PR；按上游 `AGENTS.md`，提 PR 前须先有
+Board 状态为 **Ready** 的 issue。对外提交前将新增中文注释与测试断言说明译为英文，
+仅摘取 `#5` 差异，不混入 `#1`～`#4`；未发生主人对 `#5` 的单独批准。
+
+**issue 草稿**
+
+```text
+Title: Respect a provider's zero-retry policy for HTTP-200 empty agent turns
+
+The classic Agent::reply loop retries an empty successful stream three times
+regardless of Provider::retry_config().max_retries. An embedding host can disable
+provider and transport retries for a non-idempotent chat POST, yet the classic
+loop still sends it four times when the response body is empty. Would you
+accept a narrow change that ends an empty turn immediately, with a typed Error
+block persisted to the conversation, when the provider has max_retries=0?
+Providers using the default retry config would retain the existing 1+3 path;
+recipe retry, goal/grind, and state-machine behavior would remain unchanged.
+```
+
+**PR 标题**
+
+```text
+fix(agents): honor zero-retry providers on empty successful turns
+```
+
+**PR 正文草稿**
+
+```markdown
+### Problem
+
+The classic agent loop retries a successful but empty model stream up to three
+additional times even when the provider disables retries. These may replay a
+non-idempotent chat POST; after exhaustion, the plain assistant text also looks
+like a normal completed answer to embedding clients.
+
+### Change
+
+In the classic `RetryResult::Skipped` empty-turn branch only, check the existing
+`Provider::retry_config().max_retries`. If zero, persist and emit an assistant
+`Error` block of kind `Other` and end without another stream request. `Other` is
+the existing kind for errors that are not authentication, context-length, or
+credits failures. The existing user-facing text stays the same; `with_error`
+marks the message user-visible and agent-invisible. Nonzero providers retain
+the existing bounded retry logic. No new retry type or public API.
+
+### Verification
+
+Drive `Agent::reply` against a provider yielding an empty stream. Before the
+change, the zero-retry case makes four calls and fails its one-call assertion;
+afterward it makes one and emits exactly one persisted typed Error (not plain
+assistant text). The default provider still makes four calls and preserves its
+original fallback, while the state-machine path still makes one. Bypassing the
+zero-retry branch makes the same test fail with four calls again.
 ```
 
 ## 待回馈上游

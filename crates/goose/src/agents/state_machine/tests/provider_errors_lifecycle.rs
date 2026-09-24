@@ -15,7 +15,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::StreamExt;
-use rmcp::model::Tool;
+use rmcp::model::{Role, Tool};
 use tokio_util::sync::CancellationToken;
 
 use crate::agents::{Agent, AgentConfig, AgentEvent, GoosePlatform, SessionConfig};
@@ -199,6 +199,7 @@ fn assert_terminal_error_block(
 
 struct EmptyStreamingProvider {
     calls: Arc<AtomicUsize>,
+    max_retries: usize,
 }
 
 #[async_trait]
@@ -209,7 +210,7 @@ impl Provider for EmptyStreamingProvider {
 
     fn retry_config(&self) -> goose_providers::retry::RetryConfig {
         goose_providers::retry::RetryConfig {
-            max_retries: 0,
+            max_retries: self.max_retries,
             ..Default::default()
         }
     }
@@ -226,21 +227,112 @@ impl Provider for EmptyStreamingProvider {
     }
 }
 
-/// 当前经典循环的 200 空轮另有固定重试，不受 provider 的零重试配置控制。
-#[tokio::test]
-async fn zero_retry_provider_still_replays_empty_successful_turn_in_classic_loop() -> Result<()> {
+async fn reply_against_empty_stream(
+    max_retries: usize,
+    use_state_machine: bool,
+) -> Result<Outcome> {
     let calls = Arc::new(AtomicUsize::new(0));
     let provider = Arc::new(EmptyStreamingProvider {
         calls: Arc::clone(&calls),
+        max_retries,
     });
-    let (emitted, _) = reply_with_provider(provider, false).await?;
-    assert_eq!(calls.load(Ordering::SeqCst), 4);
-    assert!(
-        emitted
-            .iter()
-            .any(|message| message.as_concat_text().contains("empty")),
-        "经典空轮重试耗尽后没有显式反馈"
+    let (emitted, persisted) = reply_with_provider(provider, use_state_machine).await?;
+    Ok(Outcome {
+        provider_calls: calls.load(Ordering::SeqCst),
+        emitted,
+        persisted,
+    })
+}
+
+/// 零重试实例的空轮必须在第一次成功的空 stream 后报告具名失败，不再请求 provider。
+#[tokio::test]
+async fn zero_retry_provider_ends_empty_successful_turn_with_error_without_replay() -> Result<()> {
+    let outcome = reply_against_empty_stream(0, false).await?;
+    assert_eq!(outcome.provider_calls, 1, "零重试仍重放了非幂等的空轮请求");
+    let emitted_errors: Vec<_> = outcome
+        .emitted
+        .iter()
+        .flat_map(|message| {
+            message
+                .content
+                .iter()
+                .filter_map(|content| content.as_error())
+        })
+        .collect();
+    assert_eq!(
+        emitted_errors.len(),
+        1,
+        "事件流应恰有一个 Error 块：{:?}",
+        outcome.emitted
     );
+    assert_eq!(emitted_errors[0].kind, MessageErrorKind::Other);
+    assert_eq!(
+        emitted_errors[0].message,
+        "The model returned an empty response. Please resend your message to continue."
+    );
+    assert_eq!(
+        outcome
+            .emitted
+            .iter()
+            .filter(|message| message.error_kind().is_some())
+            .count(),
+        1,
+        "事件流不能重复发出错误"
+    );
+    assert!(
+        outcome
+            .emitted
+            .iter()
+            .all(|message| message.role != Role::Assistant
+                || message
+                    .content
+                    .iter()
+                    .all(|content| content.as_text().is_none())),
+        "空轮不能再以普通 assistant 文本伪装成功：{:?}",
+        outcome.emitted
+    );
+    let error_message = outcome
+        .persisted
+        .iter()
+        .find(|message| message.error_kind() == Some(MessageErrorKind::Other))
+        .expect("会话必须持久化空轮 Error 块");
+    assert_eq!(
+        error_message.content.len(),
+        1,
+        "持久化消息应只包含 Error 块"
+    );
+    assert_eq!(error_message.content[0].as_error(), Some(emitted_errors[0]));
+    assert!(error_message.is_user_visible(), "主人必须看得见空轮错误");
+    assert!(
+        !error_message.is_agent_visible(),
+        "下一轮模型不应读到空轮错误"
+    );
+    Ok(())
+}
+
+/// 默认 provider 仍按既有固定 1+3 次空轮重试，不受零重试实例行为影响。
+#[tokio::test]
+async fn default_retry_provider_still_replays_empty_turn_four_times() -> Result<()> {
+    let outcome = reply_against_empty_stream(3, false).await?;
+    assert_eq!(outcome.provider_calls, 4);
+    assert!(outcome.emitted.iter().any(|message| {
+        message.role == Role::Assistant
+            && message.as_concat_text()
+                == "The model returned an empty response. Please resend your message to continue."
+    }));
+    Ok(())
+}
+
+/// 状态机空轮本就只调用一次 provider，经典循环的修补不得改变它。
+#[tokio::test]
+async fn state_machine_does_not_replay_zero_retry_empty_turn() -> Result<()> {
+    let outcome = reply_against_empty_stream(0, true).await?;
+    assert_eq!(outcome.provider_calls, 1);
+    assert!(outcome.emitted.iter().any(|message| {
+        message.role == Role::Assistant
+            && message.as_concat_text()
+                == "The model returned an empty response. Please resend your message to continue."
+    }));
     Ok(())
 }
 

@@ -52,8 +52,8 @@ use crate::context_mgmt::{
     check_if_compaction_needed, compact_messages, DEFAULT_COMPACTION_THRESHOLD,
 };
 use crate::conversation::message::{
-    ActionRequiredData, InferenceMetadata, Message, MessageContent, MessageUsage, ProviderMetadata,
-    SystemNotificationType,
+    ActionRequiredData, InferenceMetadata, Message, MessageContent, MessageErrorKind, MessageUsage,
+    ProviderMetadata, SystemNotificationType,
 };
 use crate::conversation::{debug_conversation_fix, fix_conversation, Conversation};
 use crate::permission::permission_inspector::PermissionInspector;
@@ -3410,12 +3410,19 @@ impl Agent {
                                     yield AgentEvent::HistoryReplaced(conversation.clone());
                                 }
                                 Ok(RetryResult::Skipped) if empty_response => {
-                                    // No recipe retry configured, and this empty
-                                    // turn would otherwise fall through to a
-                                    // silent exit. Retry a bounded number of
-                                    // times, then surface a visible message so
-                                    // the user is never left with no response.
-                                    if empty_turn_retries < MAX_EMPTY_TURN_RETRIES {
+                                    // 零重试配置用于不能安全重放的请求；已成功的空应答也不能再补发。
+                                    if self.provider().await?.retry_config().max_retries == 0 {
+                                        warn!("Provider returned an empty response; ending turn without replay");
+                                        let message = persist_and_push_message_with_id(
+                                            &session_manager,
+                                            &session_config.id,
+                                            &mut conversation,
+                                            Message::assistant().with_error(MessageErrorKind::Other, EMPTY_TURN_MESSAGE),
+                                        )
+                                        .await?;
+                                        yield AgentEvent::Message(message);
+                                        exit_chat = true;
+                                    } else if empty_turn_retries < MAX_EMPTY_TURN_RETRIES {
                                         empty_turn_retries += 1;
                                         retrying_after_empty_turn = true;
                                         warn!(
