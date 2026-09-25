@@ -226,6 +226,8 @@ pub struct AgentConfig {
     /// （原行为）；`Some(vec![])` ⇒ 一个 hints 文件都不读。见
     /// [`AgentConfig::with_context_file_names`]。
     pub context_file_names: Option<Vec<String>>,
+    /// 工具目录读取失败时是否必须向嵌入方传播错误。
+    pub strict_tool_list: bool,
 }
 
 impl AgentConfig {
@@ -251,6 +253,7 @@ impl AgentConfig {
             use_login_shell_path: None,
             is_subagent: false,
             context_file_names: None,
+            strict_tool_list: false,
         }
     }
 
@@ -266,6 +269,12 @@ impl AgentConfig {
     /// ⚠️ 由 `summon` 派生的子 Agent 自建 `AgentConfig`，**不继承**本字段。
     pub fn with_context_file_names(mut self, context_file_names: Vec<String>) -> Self {
         self.context_file_names = Some(context_file_names);
+        self
+    }
+
+    /// 在嵌入模式下严格传播工具目录读取错误。
+    pub fn with_strict_tool_list(mut self, strict_tool_list: bool) -> Self {
+        self.strict_tool_list = strict_tool_list;
         self
     }
 
@@ -450,18 +459,22 @@ impl Agent {
         let use_login_shell_path = config.resolve_use_login_shell_path();
         let is_subagent = config.is_subagent;
         let context_file_names = config.context_file_names.clone();
+        let strict_tool_list = config.strict_tool_list;
         Self {
             provider: provider.clone(),
             config,
             current_goose_mode: Mutex::new(initial_mode),
-            extension_manager: Arc::new(ExtensionManager::new(
-                provider.clone(),
-                session_manager,
-                scheduler,
-                client_name,
-                capabilities,
-                use_login_shell_path,
-            )),
+            extension_manager: Arc::new(
+                ExtensionManager::new(
+                    provider.clone(),
+                    session_manager,
+                    scheduler,
+                    client_name,
+                    capabilities,
+                    use_login_shell_path,
+                )
+                .with_strict_tool_list(strict_tool_list),
+            ),
             final_output_tool: Arc::new(Mutex::new(None)),
             prompt_manager: Mutex::new(PromptManager::with_context_file_names(context_file_names)),
             tool_confirmation_router: ToolConfirmationRouter::new(),
@@ -1475,12 +1488,22 @@ impl Agent {
     }
 
     pub async fn list_tools(&self, session_id: &str, extension_name: Option<String>) -> Vec<Tool> {
+        self.list_tools_strict(session_id, extension_name)
+            .await
+            .unwrap_or_default()
+    }
+
+    /// 读取工具目录并传播扩展失败；嵌入宿主可用它避免把故障当空目录。
+    pub async fn list_tools_strict(
+        &self,
+        session_id: &str,
+        extension_name: Option<String>,
+    ) -> ExtensionResult<Vec<Tool>> {
         let include_final_output = extension_name.is_none();
         let mut prefixed_tools = self
             .extension_manager
             .get_prefixed_tools(session_id, extension_name)
-            .await
-            .unwrap_or_default();
+            .await?;
 
         if include_final_output {
             if let Some(final_output_tool) = self.final_output_tool.lock().await.as_ref() {
@@ -1488,7 +1511,7 @@ impl Agent {
             }
         }
 
-        prefixed_tools
+        Ok(prefixed_tools)
     }
 
     pub async fn remove_extension(&self, name: &str, session_id: &str) -> Result<()> {

@@ -764,12 +764,10 @@ impl Operation<Session, GooseEffect> for ToolExecutionOperation<'_> {
     }
 
     async fn inference_tools(&self, session: &Session) -> Result<Vec<Tool>> {
-        let tools = self
+        Ok(self
             .extension_manager
             .get_prefixed_tools_excluding(&session.id, crate::skills::EXTENSION_NAME)
-            .await
-            .unwrap_or_default();
-        Ok(tools)
+            .await?)
     }
 
     async fn moim_parts(
@@ -857,8 +855,7 @@ impl Operation<Session, GooseEffect> for ToolExecutionOperation<'_> {
         let known_tools: HashSet<_> = self
             .extension_manager
             .get_prefixed_tools_excluding(&session.id, crate::skills::EXTENSION_NAME)
-            .await
-            .unwrap_or_default()
+            .await?
             .into_iter()
             .map(|tool| tool.name.to_string())
             .collect();
