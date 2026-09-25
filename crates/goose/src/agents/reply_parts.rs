@@ -199,7 +199,12 @@ impl Agent {
         session_id: &str,
         working_dir: &std::path::Path,
     ) -> Result<(Vec<Tool>, Vec<Tool>, String, ModelConfig)> {
-        let tools = self.list_tools(session_id, None).await;
+        // 严格嵌入模式不能把工具目录故障伪装成空目录；CLI 继续保留兼容降级。
+        let tools = if self.config.strict_tool_list {
+            self.list_tools_strict(session_id, None).await?
+        } else {
+            self.list_tools(session_id, None).await
+        };
         ensure_unique_tool_names(&tools)?;
 
         #[cfg(feature = "code-mode")]
