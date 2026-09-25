@@ -1488,12 +1488,22 @@ impl Agent {
     }
 
     pub async fn list_tools(&self, session_id: &str, extension_name: Option<String>) -> Vec<Tool> {
+        self.list_tools_strict(session_id, extension_name)
+            .await
+            .unwrap_or_default()
+    }
+
+    /// 读取工具目录并传播扩展失败；嵌入宿主可用它避免把故障当空目录。
+    pub async fn list_tools_strict(
+        &self,
+        session_id: &str,
+        extension_name: Option<String>,
+    ) -> ExtensionResult<Vec<Tool>> {
         let include_final_output = extension_name.is_none();
         let mut prefixed_tools = self
             .extension_manager
             .get_prefixed_tools(session_id, extension_name)
-            .await
-            .unwrap_or_default();
+            .await?;
 
         if include_final_output {
             if let Some(final_output_tool) = self.final_output_tool.lock().await.as_ref() {
@@ -1501,7 +1511,7 @@ impl Agent {
             }
         }
 
-        prefixed_tools
+        Ok(prefixed_tools)
     }
 
     pub async fn remove_extension(&self, name: &str, session_id: &str) -> Result<()> {
