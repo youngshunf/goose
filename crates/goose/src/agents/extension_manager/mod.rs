@@ -18,7 +18,8 @@ use tracing::warn;
 
 use super::container::Container;
 use super::extension::{
-    ExtensionConfig, ExtensionInfo, ExtensionResult, PlatformExtensionContext, PLATFORM_EXTENSIONS,
+    ExtensionConfig, ExtensionError, ExtensionInfo, ExtensionResult, PlatformExtensionContext,
+    PLATFORM_EXTENSIONS,
 };
 use super::tool_execution::{ToolCallContext, ToolCallNotificationEmitter, ToolCallResult};
 use super::types::SharedProvider;
@@ -177,6 +178,7 @@ pub struct ExtensionManager {
     tools_cache_version: AtomicU64,
     client_name: String,
     capabilities: ExtensionManagerCapabilities,
+    strict_tool_list: bool,
 }
 
 /// A flattened representation of a resource used by the agent to prepare inference
@@ -429,7 +431,15 @@ impl ExtensionManager {
             tools_cache_version: AtomicU64::new(0),
             client_name,
             capabilities,
+            strict_tool_list: false,
         }
+    }
+
+    /// 在嵌入模式下将工具目录读取错误作为显式失败返回；CLI 默认保持兼容降级。
+    #[must_use]
+    pub(crate) fn with_strict_tool_list(mut self, strict: bool) -> Self {
+        self.strict_tool_list = strict;
+        self
     }
 
     pub fn new_without_provider(data_dir: std::path::PathBuf) -> Self {
@@ -827,6 +837,7 @@ impl ExtensionManager {
             .collect();
 
         let cancel_token = CancellationToken::default();
+        let strict_tool_list = self.strict_tool_list;
         let client_futures = clients.into_iter().map(|(name, config, client)| {
             let cancel_token = cancel_token.clone();
             let ext_name = name.clone();
@@ -838,8 +849,13 @@ impl ExtensionManager {
                 {
                     Ok(t) => t,
                     Err(e) => {
+                        if strict_tool_list {
+                            return Err(ExtensionError::SetupError(format!(
+                                "failed to list tools for extension {ext_name}: {e}"
+                            )));
+                        }
                         warn!(extension = %ext_name, error = %e, "Failed to list tools");
-                        return (name, vec![]);
+                        return Ok((name, vec![]));
                     }
                 };
 
@@ -888,17 +904,22 @@ impl ExtensionManager {
                     {
                         Ok(t) => t,
                         Err(e) => {
+                            if strict_tool_list {
+                                return Err(ExtensionError::SetupError(format!(
+                                    "failed to list tools for extension {ext_name} page: {e}"
+                                )));
+                            }
                             warn!(extension = %ext_name, error = %e, "Failed to list tools (pagination)");
                             break;
                         }
                     };
                 }
 
-                (name, tools)
+                Ok((name, tools))
             }
         });
 
-        let results = future::join_all(client_futures).await;
+        let results = future::try_join_all(client_futures).await?;
 
         let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut tools = Vec::new();
@@ -1955,6 +1976,97 @@ mod tests {
         } else {
             panic!("Expected ErrorData with ErrorCode::RESOURCE_NOT_FOUND");
         }
+    }
+
+    struct FailingToolListClient {
+        fail_on_page: bool,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl McpClientTrait for FailingToolListClient {
+        fn get_info(&self) -> Option<&InitializeResult> {
+            None
+        }
+
+        async fn list_tools(
+            &self,
+            _session_id: &str,
+            next_cursor: Option<String>,
+            _cancellation_token: CancellationToken,
+        ) -> Result<ListToolsResult, Error> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if !self.fail_on_page || next_cursor.is_some() {
+                return Err(Error::TransportClosed);
+            }
+            Ok(ListToolsResult {
+                tools: vec![Tool::new(
+                    "first".to_string(),
+                    "first page".to_string(),
+                    Arc::new(JsonObject::new()),
+                )],
+                next_cursor: Some("page-2".to_string()),
+                ..Default::default()
+            })
+        }
+
+        async fn call_tool(
+            &self,
+            _ctx: &ToolCallContext,
+            _name: &str,
+            _arguments: Option<JsonObject>,
+            _cancellation_token: CancellationToken,
+        ) -> Result<CallToolResult, Error> {
+            Err(Error::TransportClosed)
+        }
+    }
+
+    #[tokio::test]
+    async fn strict_tool_list_first_page_failure_is_named_and_not_cached() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manager = ExtensionManager::new_without_provider(temp_dir.path().to_path_buf())
+            .with_strict_tool_list(true);
+        let client = Arc::new(FailingToolListClient {
+            fail_on_page: false,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        manager
+            .add_mock_extension("broken".to_string(), client.clone())
+            .await;
+
+        for _ in 0..2 {
+            let error = manager
+                .get_prefixed_tools("session", None)
+                .await
+                .expect_err("严格目录不能把首次失败变成空目录");
+            assert!(error.to_string().contains("broken"));
+            assert!(error.to_string().to_lowercase().contains("transport"));
+        }
+        assert_eq!(client.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn strict_tool_list_later_page_failure_is_named_and_not_cached() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manager = ExtensionManager::new_without_provider(temp_dir.path().to_path_buf())
+            .with_strict_tool_list(true);
+        let client = Arc::new(FailingToolListClient {
+            fail_on_page: true,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        manager
+            .add_mock_extension("paged".to_string(), client.clone())
+            .await;
+
+        for _ in 0..2 {
+            let error = manager
+                .get_prefixed_tools("session", None)
+                .await
+                .expect_err("严格目录不能把分页失败变成部分目录");
+            assert!(error.to_string().contains("paged"));
+            assert!(error.to_string().to_lowercase().contains("transport"));
+        }
+        assert_eq!(client.calls.load(Ordering::SeqCst), 4);
     }
 
     #[tokio::test]
