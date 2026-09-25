@@ -974,7 +974,7 @@ Err(e) => { warn!(...); return (name, vec![]); }
 ⇒ 在上游给出载体之前，这一格在 `hasn-node` 侧登记为缺口
 （`scripts/guards/tool-host-wiring.json` 的 ⑨），⛔ 不是通过。
 
-📌 与 `F-1` / `F-2` 一样：**对外提交 PR 要主人授权，尚未提交。**
+📌 与 `F-1` / `F-2` 一样：**本地 exploratory 实现已提交 `8221c90b2`，未向上游提交 PR，也未 push。** Node 尚未消费严格模式，仍需后续 rev/lock 接线与生产链验证。
 
 ## 上游同步记录
 
