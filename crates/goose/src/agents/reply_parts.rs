@@ -1636,6 +1636,79 @@ mod tests {
         assert_eq!(tool_call.name, "recipe__final_output");
     }
 
+    // `Agent::new` 会初始化 SessionManager 的 sqlx 连接池，需要 Tokio 上下文；
+    // 用 tokio::test 让本用例单独筛选运行时也不依赖别的用例先把单例建好。
+    #[tokio::test]
+    async fn categorize_tool_requests_recovers_name_copied_from_sanitized_history_replay() {
+        // 广告名含点（`hasn__hasn.tool.call`）。上一轮调用经 OpenAI 格式回放进历史时，
+        // tool_calls 名字被 sanitize 成下划线形态；模型照抄历史再发出来，必须认回
+        // 规范广告名去执行，⛔ 不得判成 "not advertised"（白费一步且留一条失败调用）。
+        let agent = crate::agents::Agent::new();
+        let owner_meta = rmcp::model::MetaObject(
+            serde_json::json!({ "goose_extension": "hasn" })
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
+        let call_tool = Tool::new(
+            "hasn__hasn.tool.call",
+            "call",
+            object!({ "type": "object" }),
+        )
+        .with_meta(owner_meta.clone());
+        let describe_tool = Tool::new(
+            "hasn__hasn.tool.describe",
+            "describe",
+            object!({ "type": "object" }),
+        )
+        .with_meta(owner_meta);
+
+        // 走真实的回放序列化，取模型在历史里看到的那个名字，而不是在测试里手写它。
+        let previous_turn = Message::assistant().with_tool_request(
+            "tool-0",
+            Ok(rmcp::model::CallToolRequestParams::new(
+                "hasn__hasn.tool.describe",
+            )),
+        );
+        let replayed = goose_providers::formats::openai::format_messages(
+            &[previous_turn],
+            &goose_providers::images::ImageFormat::OpenAi,
+        );
+        let replayed_name = replayed
+            .iter()
+            .find_map(|m| m["tool_calls"][0]["function"]["name"].as_str())
+            .expect("assistant tool_calls must be replayed")
+            .to_string();
+        assert_eq!(replayed_name, "hasn__hasn_tool_describe");
+
+        // 模型按历史的写法类推出兄弟工具名。
+        let copied_call_name = replayed_name.replace("_describe", "_call");
+        for (emitted, expected) in [
+            (replayed_name.as_str(), "hasn__hasn.tool.describe"),
+            (copied_call_name.as_str(), "hasn__hasn.tool.call"),
+        ] {
+            let response = Message::assistant().with_tool_request(
+                "tool-1",
+                Ok(rmcp::model::CallToolRequestParams::new(emitted.to_string())),
+            );
+            let (tool_requests, _) = agent.categorize_tool_requests(
+                &response,
+                &[call_tool.clone(), describe_tool.clone()],
+                &[],
+                false,
+            );
+            assert_eq!(tool_requests.len(), 1);
+            let tool_call = tool_requests[0]
+                .tool_call
+                .as_ref()
+                .unwrap_or_else(|e| panic!("{emitted} must be recovered, got {e:?}"));
+            assert_eq!(
+                tool_call.name, expected,
+                "{emitted} must be canonicalized to the advertised dotted name"
+            );
+        }
+    }
+
     #[test]
     fn categorize_tool_requests_rejects_unrecoverable_unadvertised_name() {
         let agent = crate::agents::Agent::new();

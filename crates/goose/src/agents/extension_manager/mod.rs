@@ -31,6 +31,7 @@ use crate::agents::reply_parts::is_tool_visible_to_app;
 use crate::config::extensions::name_to_key;
 use crate::config::Config;
 use crate::oauth::GooseCredentialStore;
+use goose_providers::formats::openai::sanitize_function_name;
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, ContentBlock, ErrorCode, ErrorData, GetPromptResult,
     ListResourcesResult, ListToolsResult, MetaObject, Prompt, Resource, ResourceContents,
@@ -286,11 +287,25 @@ pub(crate) fn recover_mangled_tool_name<'a>(
         let owner_mangled = owner.map(|o| format!("{o}.{name}"));
         let owner_prefixed = owner.map(|o| format!("{o}__{name}"));
 
+        // 广告名含 `[^a-zA-Z0-9_-]` 字符（如 `hasn__hasn.tool.call`）时，OpenAI 系格式
+        // 回放历史 assistant tool_calls 会经 `sanitize_function_name` 改写成
+        // `hasn__hasn_tool_call`；模型照抄历史里的写法再发出来，就是这个形态。
+        // 复用序列化时的同一个函数判等，⛔ 不另写一份规则，两处才不会漂移。
+        // owner 组合形态不需要再 sanitize 一遍：历史里回放的是恢复后的**规范广告名**本身。
+        let history_sanitized = sanitize_function_name(name) == stripped;
+
         let matches = stripped == name
             || separator_mangled.as_deref() == Some(stripped)
             || owner_mangled.as_deref() == Some(stripped)
-            || owner_prefixed.as_deref() == Some(stripped);
-        if name == emitted || !matches {
+            || owner_prefixed.as_deref() == Some(stripped)
+            || history_sanitized;
+        // 模型发出的名字本身就是已广告的工具 ⇒ 无须恢复。⛔ 不能跳过它再去匹配别的工具：
+        // 同时广告 `a_b` 与 `a.b` 时，对 `a_b` 的精确调用会被上一条改写成 `a.b`
+        // （状态机 `canonicalize_tool_request_names` 对每个名字都调本函数）。
+        if name == emitted {
+            return None;
+        }
+        if !matches {
             continue;
         }
 
@@ -2714,6 +2729,62 @@ mod tests {
         assert_eq!(
             recover_mangled_tool_name("dev_a.shell", ambiguous.iter().copied()).as_deref(),
             Some("shell")
+        );
+    }
+
+    #[test]
+    fn test_recover_mangled_tool_name_history_sanitized_form() {
+        // 广告名含点：OpenAI 系格式回放历史时 tool_calls 名字经 sanitize_function_name
+        // 变成下划线形态，模型照抄历史再发出来，必须认回规范广告名。
+        let tools = [
+            ("hasn__hasn.tool.call", Some("hasn")),
+            ("hasn__hasn.tool.describe", Some("hasn")),
+        ];
+        assert_eq!(
+            recover_mangled_tool_name("hasn__hasn_tool_call", tools.iter().copied()).as_deref(),
+            Some("hasn__hasn.tool.call")
+        );
+        assert_eq!(
+            recover_mangled_tool_name("hasn__hasn_tool_describe", tools.iter().copied()).as_deref(),
+            Some("hasn__hasn.tool.describe")
+        );
+        assert_eq!(
+            recover_mangled_tool_name("functions.hasn__hasn_tool_call", tools.iter().copied())
+                .as_deref(),
+            Some("hasn__hasn.tool.call")
+        );
+        // 判等用的就是序列化时那个函数：这里断言两边同源，防有人另写一份规则漂移。
+        assert_eq!(
+            recover_mangled_tool_name(
+                &goose_providers::formats::openai::sanitize_function_name("hasn__hasn.tool.call"),
+                tools.iter().copied()
+            )
+            .as_deref(),
+            Some("hasn__hasn.tool.call")
+        );
+
+        // 只是「像」不算：sanitize 后仍不相等的名字照旧不恢复。
+        assert_eq!(
+            recover_mangled_tool_name("hasn__hasn_tool_calls", tools.iter().copied()),
+            None
+        );
+
+        // 歧义：两个广告名 sanitize 后相同 ⇒ 拒绝猜测。
+        let ambiguous = [("a.b", None), ("a:b", None)];
+        assert_eq!(
+            recover_mangled_tool_name("a_b", ambiguous.iter().copied()),
+            None
+        );
+
+        // 模型发出的名字本身已广告 ⇒ 不恢复成另一个 sanitize 后同形的工具。
+        let exact_and_dotted = [("a_b", None), ("a.b", None)];
+        assert_eq!(
+            recover_mangled_tool_name("a_b", exact_and_dotted.iter().copied()),
+            None
+        );
+        assert_eq!(
+            recover_mangled_tool_name("a.b", exact_and_dotted.iter().copied()),
+            None
         );
     }
 

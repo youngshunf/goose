@@ -227,6 +227,31 @@ mod canonicalization_tests {
     }
 
     #[test]
+    fn canonicalizes_names_copied_from_sanitized_history_replay() {
+        // 状态机路径与经典循环同源：广告名含点，模型照抄历史里被 sanitize 的形态。
+        let advertised = vec![
+            (
+                "hasn__hasn.tool.describe".to_string(),
+                Some("hasn".to_string()),
+            ),
+            ("hasn__hasn.tool.call".to_string(), Some("hasn".to_string())),
+        ];
+        let mut message = request("hasn__hasn_tool_call");
+
+        canonicalize_tool_request_names(&mut message, &advertised);
+
+        assert_eq!(tool_name(&message), "hasn__hasn.tool.call");
+
+        // 已广告的精确名字保持不动，⛔ 不被改写成另一个 sanitize 后同形的工具。
+        let advertised = vec![("a.b".to_string(), None), ("a_b".to_string(), None)];
+        let mut message = request("a_b");
+
+        canonicalize_tool_request_names(&mut message, &advertised);
+
+        assert_eq!(tool_name(&message), "a_b");
+    }
+
+    #[test]
     fn leaves_unrecoverable_names_unmodified() {
         let advertised = vec![("developer__shell".to_string(), None)];
         let mut message = request("developer.shell!");

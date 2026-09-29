@@ -101,6 +101,14 @@ relay 404 重试耗尽后，经典循环把 `ProviderError` 压成一条普通 a
 本片只改 fork，不合回 `hasn`、不推送；依据父仓 §2 非幂等调用及 §1 零 fake 铁律，
 不记作主人单独批准。
 
+### 2026-09-25：`#6` 施工登记
+
+施工分支 `hasn-fix/sanitized-tool-name-recovery`；worktree
+`/Users/mac/openclaw-workspace/huanxing/huanxing-project/.worktrees/goose-fork`；
+起点 `c1eb3bd917e07e4131b44042691a37be9542d0b1`（`hasn-node` `main` 当前钉的 rev）。
+由 `hasn-node` 真实 E2E `E4-2` 暴露（「ask 恰 1 次」因一条多余的失败调用而红）。
+本片只改 fork，不合回 `hasn`、不推送；⛔ 不记作主人单独批准，⛔ 不构成放宽。
+
 ## 改动登记
 
 | # | 改动点 | 类别 | 理由 | 上游回馈可能性 |
@@ -110,6 +118,7 @@ relay 404 重试耗尽后，经典循环把 `ProviderError` 压成一条普通 a
 | 3 | `crates/goose/src/agents/agent.rs`：`ProviderError::NetworkError` 与通配 `Err(ref provider_err)` 两支在 `break` 前改用现成 `persist_and_push_message_with_id(…, Message::from_provider_error(provider_err))`，生产仅 **+16 / −10**；测试在 `agents/state_machine/tests/provider_errors_lifecycle.rs`，模块登记在 `tests/mod.rs` | 内核逻辑（本任务据零 fake 不变量实施，见上；不是新增的主人单条裁决） | relay 404 重试耗尽时普通 assistant 文本被嵌入方当 `Final`，派发假成功；身份验证错误与状态机路径已有 `Error` 块先例。只改两支调用、零新 API；不动拒答及 compact | 🟢 **高**。经典循环对齐已有状态机行为，不含唤星业务。上游 PR 材料见下节，⚠️ 尚未提交 |
 | 4 | `crates/goose-providers/src/openai_compatible.rs`：实例级 `with_retry_config(RetryConfig)` 覆写 `Provider::retry_config()`；`api_client.rs`：实例级 `with_no_transport_retry()` 在所有客户端重建时复施 reqwest `retry::never()`；测试覆盖 provider、真实本地 HTTP/SSE、真实 h2 NACK 与经典空轮反例 | 内核接入的窄公开挂点（本任务依据父仓 §2 非幂等 POST 不自动重放及 §1 零假回落；**没有**主人另行单条裁决） | 本地 relay chat POST 未见稳定去重键与服务端保证；缺省 provider 额外重试 3 次，Agent 首流项前可额外重发，reqwest 0.13.5 默认协议 NACK 还可重发 2 次。两处逐实例装配，其他 provider/默认实例保持原行为；⚠️ 经典 200 空轮和认证刷新仍有独立重发，故 #4 **不等于**全链零自动重放 | 🟢 **高**。通用嵌入方按实例选重试策略，默认零变化；见下方 PR 草稿，尚未向上游提交 |
 | 5 | `crates/goose/src/agents/agent.rs`：只在经典循环 `RetryResult::Skipped` 的空轮分支检查现有 `provider.retry_config().max_retries == 0`；首次空轮即通过既有 `persist_and_push_message_with_id` 发出并保存 `Message::assistant().with_error(MessageErrorKind::Other, EMPTY_TURN_MESSAGE)`，不再调用第二次 `Provider::stream`；原 #4 反例翻面并增默认及状态机对照 | 内核逻辑（据父仓 §2 非幂等 POST 不重发及 §1 零 fake 实施，**没有**主人另行单条裁决） | 200 成功空轮也是已发送的非幂等请求；零重试实例原额外发 3 次，且普通 assistant 文本被当正常答复。现闭集里 `Authentication`、`ContextLengthExceeded`、`CreditsExhausted` 均与事实不符，因此取 `Other`；`with_error` 为主人可见、模型不可见，错误在事件流和会话中均可判 | 🟢 **高**。与宿主业务无关，复用现有配置和错误消息接口；上游 PR 仅备材料，尚未对外提交 |
+| 6 | `crates/goose/src/agents/extension_manager/mod.rs`：`recover_mangled_tool_name` 多认一种形态——`sanitize_function_name(广告名) == 模型发出的名字`（复用 `goose-provider-types/src/formats/openai.rs` 序列化时的**同一个**函数，零新正则）；同时把「发出名本身已广告」从 `continue` 改成 `return None`。生产 **+16 / −2**（含一行 `use`）；测试在同文件、`agents/reply_parts.rs`、`agents/state_machine/ops_llm.rs` 各一条 | 内核逻辑（据 E2E 缺陷修复实施，**没有**主人另行单条裁决） | 广告名含点（`hasn__hasn.tool.call`）时 `format_tools` 原样下发，而 OpenAI 系格式回放历史 assistant `tool_calls` 经 `sanitize_function_name` 变成 `hasn__hasn_tool_call`；模型照抄历史写法再发出，经典循环 `categorize_tool_requests` 判 `not advertised`、状态机同样认不回，白费一步并留下一条失败调用 | 🟢 **高**。任何含 `.`/`:` 等字符的 MCP 工具名都会命中，与唤星业务零耦合；wire 形态零变化。PR 材料见下节，尚未对外提交 |
 
 > 加一条 patch 就在上表加一行，**不要攒着**。评审判据是：
 > 这张表的行数 == `git diff upstream/main...hasn` 里非裁剪类改动的处数。
@@ -323,6 +332,39 @@ session::session_manager::tests::create_session`）：
   `cargo fmt --all -- --check`、`cargo clippy -p goose --lib --tests -- -D warnings`
   与 `git diff --check` 均 rc=0，Clippy 输出包含 `Checking goose v1.51.0`。
   未运行全量 gate/E2E，也未合主 clone 或 push。
+
+### `#6` 的最小性、行为与证伪
+
+- **两处不一致的来源**：`formats/openai.rs::format_tools` 把广告名原样发出（含点），
+  同文件消息回放（`format_messages_with_options` 的 `ToolRequest` 分支）对 `tool_call.name`
+  调 `sanitize_function_name`（`[^a-zA-Z0-9_-]` → `_`，截 128）；`google.rs`、`databricks.rs`、
+  `openai_responses.rs` 回放同样调它。⇒ 模型在历史里看到的是下划线形态。
+- **为什么修在恢复而不是改回放**：回放 sanitize 是为严格 OpenAI 兼容端点（历史里名字含点会被拒），
+  去掉它会破坏那类端点；反向把 `format_tools` 也 sanitize 会改变 wire 形态、让模型只看得到
+  下划线名，而模型发回来的名字仍需恢复——两条都比「恢复函数多认一种已知形态」改动面大。
+  本修法 wire 零变化，只影响**本来就会被判 not advertised** 的名字。
+- **经典循环与状态机同源**：`reply_parts.rs::categorize_tool_requests` 与
+  `state_machine/ops_llm.rs::canonicalize_tool_request_names` 都只调 `recover_mangled_tool_name`，
+  两条路径各一条用例锁住。
+- **顺带堵住的一格**：原判 `if name == emitted || !matches { continue }` 在发出名本身已广告时
+  **跳过它继续匹配别的工具**；状态机对每个名字都调本函数，新增 sanitize 形态后同时广告
+  `a_b` 与 `a.b` 时对 `a_b` 的精确调用会被改写成 `a.b`。改为命中即 `return None`（不改写）。
+  既有形态下这格不可达（`__`↔`.` 与 owner 组合都不会让一个已广告名等于另一个的变形）。
+- **歧义**：两个广告名 sanitize 后相同（`a.b` 与 `a:b`，模型发 `a_b`）照既有逻辑 `None`。
+- **先红后绿 / 变异**（`CARGO_TARGET_DIR=/Volumes/ExtraData/cargo-targets/goose-fork`）：
+  把新判定旁路为 `(false && history_sanitized)` ⇒ 三条新用例全红（rc=101）；
+  把 `return None` 改回 `continue` ⇒ `extension_manager` 与 `ops_llm` 两条红
+  （`Some("a.b")`≠`None`、`"a.b"`≠`"a_b"`，rc=101），`reply_parts` 那条仍绿（它不测那一格）。
+  还原后 `cargo test -p goose --lib`：**2315 passed / 5 failed**，5 条均与本片无关且在
+  未改动代码上同样成因：`prompt_manager::tests::test_all_platform_extensions`（`code-mode`
+  快照，见下方 `#2` 旧注）与 4 条 `jsonwebtoken` CryptoProvider 未选定
+  （`chatgpt_codex` 1 条、`gcpauth` 3 条）。`cargo test -p goose-provider-types --lib -- sanitize`
+  25 passed rc=0；`cargo fmt --all -- --check`、`cargo clippy -p goose --lib --tests -- -D warnings`、
+  `git diff --check` 均 rc=0。
+- ⚠️ `reply_parts` 那条用例是 `#[tokio::test]`：`Agent::new` 会初始化 `SESSION_STORAGE`
+  的 sqlx 池，需要 Tokio 上下文。同文件既有的 `categorize_tool_requests_*` 是 `#[test]`，
+  **单独筛选**（`-- reply_parts`）运行时会因此 11 条全红，全量跑时靠别的用例先建好单例而绿——
+  上游原有的顺序依赖，本片未动。
 
 📌 影响面更宽的一轮 `cargo test -p goose --lib -- agents:: hints::`（跑在 `d628fd95f`，与 `70deb52a7` 只差一个测试辅助函数的写法——为过 clippy 的 `string_slice` 改成 `split_once`）：**624 passed / 1 failed**，
 红的是 `agents::prompt_manager::tests::test_all_platform_extensions`，**与 `#2` 无关**：
@@ -796,6 +838,25 @@ afterward it makes one and emits exactly one persisted typed Error (not plain
 assistant text). The default provider still makes four calls and preserves its
 original fallback, while the state-machine path still makes one. Bypassing the
 zero-retry branch makes the same test fail with four calls again.
+```
+
+### `#6` 的上游 PR 材料草稿（⚠️ 尚未提交）
+
+⛔ 只备本地材料，不对外发送；提 PR 前须先有 Board 状态 **Ready** 的 issue，
+新增中文注释译为英文，仅摘取 `#6` 差异。
+
+```text
+Title: Recover tool names the model copied from sanitized history replay
+
+Tools whose public name contains characters outside [a-zA-Z0-9_-] (e.g. an MCP
+tool "ext__ns.tool.call") are advertised verbatim, but OpenAI-style formats
+replay prior assistant tool_calls through sanitize_function_name, so the model
+sees "ext__ns_tool_call" in its own history. Models then reuse that spelling and
+the call is rejected as "not advertised for this model turn", wasting a step and
+leaving a failed tool call. recover_mangled_tool_name already canonicalizes other
+known manglings; it should also accept sanitize_function_name(advertised) ==
+emitted, reusing the same function the formatter uses. Ambiguous matches stay
+unrecovered. No wire-format change.
 ```
 
 ## 待回馈上游
