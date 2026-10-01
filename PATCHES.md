@@ -1223,6 +1223,57 @@ resolver 2 在只编 lib 时**不做 dev-dep 的 feature 合一** ⇒ `cargo che
 `ops_toolcalling.rs:778`（`SubdirectoryHintTracker::new()`），与 `#2` 打的位置一致 ⇒ 预计无文本冲突；
 **合完仍要按 `#2` 的最小性表重跑**，尤其「读 hints 的生产路径被穷举」那一行。
 
+### 2026-10-01：第二次上游同步（距上次 9 天）
+
+| 项 | 值 |
+|---|---|
+| 上游 HEAD | `bab8ff641039c9cd3331121cd84a5c6045f365ca`（2026-09-30 17:51:51 +0000，`fix: session naming/"none" reasoning effort fails for gpt-6.1-sol (#12605)`） |
+| 上一基点 | `96009644e`（2026-09-22 那次同步） |
+| `main` | `git fetch upstream main:main` 真 fast-forward 到 `bab8ff641` |
+| 合并方式 | merge（`hasn` 已发布，禁 rebase/force-push）；在父仓 `.worktrees/goose-upstream-sync-20261001`（分支 `chore/upstream-sync-20261001`）合并验证后快进 `hasn` |
+| 上游提交数 | **49**，`199 files changed, 31665 insertions(+), 11638 deletions(-)` |
+| 上游版本 | `1.51.0` → **`1.53.0`**；`edition`/`rust-version`/`channel` 仍是 `2021`/`1.94.1`/`1.96.1` |
+| workspace crates | 仍是 15 个，集合未变 |
+
+#### 冲突与修正（两处，都在薄 patch 上）
+
+1. **文本冲突 `crates/goose/src/agents/agent.rs`（`#5` 空轮分支）**：上游 `dad453726`（#12468）给同一个 match arm 加了守卫
+   `&& !ends_with_successful_tool_response(conversation.messages())`（以成功工具调用收尾的空轮不再告警重试）。
+   解法：**守卫取上游、arm 体保留 `#5`**（零重试实例首个空轮即发 `Error` 块、不再补发）。两者正交：上游排除的那类空轮本来就不该进 `#5`。
+2. **语义冲突（Git 未报，编译才暴露）`crates/goose-providers/src/api_client.rs`**：上游 `a701bb175`（#11765）新增静态
+   `ApiClient::http_client(tls_config)`，调用 `client_builder(timeout)`；而 `#4` 已把它改成 `client_builder(timeout, no_transport_retry)`。
+   解法：该处传 `false`。它不属于任何 provider 实例，`#4` 的语义是「逐实例 opt-in、缺省零变化」⇒ 保持上游缺省行为。`#4` 生产改动面因此多 1 个实参。
+
+#### 薄 patch `#1`–`#6` 去向：全部还在
+
+- `#1`：`git diff upstream/main -- crates/goose/src/session/session_manager.rs | grep -c '^-[^-]'` 仍为 **0**；上游本轮动过该文件（+62/−0 净增，含 `nostr_share` 移除相关），`sessions` 表无新列、`migrate_to_version` 无新分支。
+- `#2`：三处读点仍经 `context_file_names` 转交；`get_context_filenames()`/`SubdirectoryHintTracker::new()` 的生产调用点只剩 `hints/load_hints.rs` 自身。
+- `#3`：经典循环 `Message::from_provider_error` 三处仍在。`#4`：`with_retry_config`/`with_no_transport_retry` 仍在（见上 2）。`#5`：见上 1。`#6`：`recover_mangled_tool_name` 的 `sanitize_function_name` 认回仍在。
+- 上游**没有**提供任一 patch 的等价能力，PR 材料仍待提交。
+
+#### 验证（本机，2026-10-01）
+
+| 命令 | 结果 |
+|---|---|
+| `cargo check -p goose -p goose-providers -p goose-provider-types --lib --no-default-features`（= `hasn-node` 消费形态） | rc=0 |
+| `RUST_MIN_STACK=8388608 cargo test -p goose --lib --no-default-features --features rustls-tls,code-mode,tree-sitter,live-voice,scheduler,platform-apps,chat-recall,acp-http` | 连跑两次 `ok. 2352 passed; 0 failed`，rc=0 |
+| `cargo test -p goose-providers --lib --no-default-features --features rustls-tls,live-websocket` | `ok. 264 passed; 0 failed`，rc=0 |
+
+⚠️ **跑法本轮变了，照旧命令会假红**：
+- 上游把 `scheduler`/`platform-apps`/`chat-recall`/`tree-sitter`/`acp-http` 改成 opt-in feature，而 lib 单测仍引用 `scheduler` 等模块 ⇒ `cargo test -p goose --lib`（缺省 feature）**编译失败**。按上游 CI（`.github/workflows/ci.yml` 的 Build and Test 步骤）显式给 feature 集；
+- 上游 CI 给测试设 `RUST_MIN_STACK=8388608`；不设时 `agents::state_machine::tests::agent_reply::bang_shell_visibility_is_enforced_when_state_machine_is_enabled` 在 macOS debug 下**栈溢出直接 abort 整个测试进程**；
+- 并行全量时偶发 2 条失败（`acp::provider::tests::rejected_retry_surfaces_the_error`、`providers::provider_secrets::tests::unconfigure_provider_clears_structured_entry`），单独跑 3/3 通过、全量重跑 2/2 通过，所在文件与 `upstream/main` 零差异 ⇒ 上游测试间共享全局配置的竞态，不是 patch 引起。
+
+未运行：`goose-cli`/`goose-server` 测试、`tests/` 下集成测试（`tests/providers.rs` 需外网）。
+
+#### 下次 `hasn-node` rev bump 时要处理的（本次**未** bump，`hasn-node` 仍钉旧 rev，构建输入不变）
+
+- 🟢 **F-2 上游已修**：`crates/goose/Cargo.toml` 的 `process-wrap` 已声明 `["std", "process-session"]` ⇒ `hasn-node` `modules/runtime-host/goose/Cargo.toml` 那条补声明的绕法可以删，并把上文 `F-2` 标为已回馈/已解决；
+- 🟡 **新 opt-in feature 在 `default-features = false` 下全部关闭**：`tree-sitter`（`analyze` 平台扩展、toolshim 解析）、`scheduler`、`platform-apps`、`chat-recall`、`acp-http`。`hasn-node` 挂载闭集本就不含 `analyze/apps/chatrecall/scheduler`，`PlatformExtensionContext.scheduler` 字段未被 cfg 门控 ⇒ 预计零改动；bump 时仍按挂载闭集守卫复核；
+- 🟢 `session/nostr_share.rs` 与 `nostr` 依赖被上游删除，`hasn-node` 零引用；
+- 公开面（`Agent::reply`、`AgentConfig::new`、`extend_system_prompt`/`remove_system_prompt_extra`、`add_extension`、`list_tools`、`update_provider`、`submit_tool_confirmation`）签名本轮**未变**。
+- 📌 专家即时装配（父仓技能 06 §4.2）需要的「extras 变更触发经典循环内重建」上游**仍未提供**（重建条件仍是 `tools_updated` 与子目录 hints），将作为新的薄 patch 单独登记，不混入本次同步。
+
 ## 消费方
 
 `hasn-node` 经 cargo git 依赖消费本仓，`rev` 钉死、**不跟分支**：
