@@ -965,7 +965,7 @@ pub enum TurnEndReason {
 同族还有 `modules/runtime-host/goose/src/events.rs` 头注里那条：`InlineMessage` 里混着终局，
 我们今天只能把整类 `InlineMessage` 当进度处理（否则每一轮自动压缩都会失败）。
 
-### `F-2`：`crates/goose` 独立构建缺 `process-wrap/process-session` feature 声明
+### `F-2`：`crates/goose` 独立构建缺 `process-wrap/process-session` feature 声明（📌 2026-10-01 上游已修，`hasn-node` 绕法已删）
 
 **登记方**：唤星 `K2`（施工文档 §1.5 `B3`）。**性质**：上游的一个 bug，不是我们的需求。
 
@@ -1266,10 +1266,10 @@ resolver 2 在只编 lib 时**不做 dev-dep 的 feature 合一** ⇒ `cargo che
 
 未运行：`goose-cli`/`goose-server` 测试、`tests/` 下集成测试（`tests/providers.rs` 需外网）。
 
-#### 下次 `hasn-node` rev bump 时要处理的（本次**未** bump，`hasn-node` 仍钉旧 rev，构建输入不变）
+#### `hasn-node` rev bump 核对项（📌 同日已 bump：`hasn-node` main `5ec1de657` 改钉 `55a4452e`，见下方「消费方」）
 
-- 🟢 **F-2 上游已修**：`crates/goose/Cargo.toml` 的 `process-wrap` 已声明 `["std", "process-session"]` ⇒ `hasn-node` `modules/runtime-host/goose/Cargo.toml` 那条补声明的绕法可以删，并把上文 `F-2` 标为已回馈/已解决；
-- 🟡 **新 opt-in feature 在 `default-features = false` 下全部关闭**：`tree-sitter`（`analyze` 平台扩展、toolshim 解析）、`scheduler`、`platform-apps`、`chat-recall`、`acp-http`。`hasn-node` 挂载闭集本就不含 `analyze/apps/chatrecall/scheduler`，`PlatformExtensionContext.scheduler` 字段未被 cfg 门控 ⇒ 预计零改动；bump 时仍按挂载闭集守卫复核；
+- 🟢 **F-2 上游已修**：`crates/goose/Cargo.toml` 的 `process-wrap` 已声明 `["std", "process-session"]` ⇒ `hasn-node` 那条补声明的绕法已随 bump 删除；
+- 🟡 **新 opt-in feature 在 `default-features = false` 下全部关闭**：`tree-sitter`（`analyze` 平台扩展、toolshim 解析）、`scheduler`、`platform-apps`、`chat-recall`、`acp-http`。生产零改动；但 `hasn-node` 挂载闭集反例测试原用上游 `analyze` 工厂，注册表里已无此项而红（测试自带「rev 推进后先回来核这张表」提示），已改用 `summarize`。另：`rmcp` 随上游升到 `3.4.1`（消费方必须同版本，否则 `McpClientTrait` 类型不一致），`Cargo.lock` 同步移除 tree-sitter 系与 tokio-cron-scheduler 等依赖；
 - 🟢 `session/nostr_share.rs` 与 `nostr` 依赖被上游删除，`hasn-node` 零引用；
 - 公开面（`Agent::reply`、`AgentConfig::new`、`extend_system_prompt`/`remove_system_prompt_extra`、`add_extension`、`list_tools`、`update_provider`、`submit_tool_confirmation`）签名本轮**未变**。
 - 📌 专家即时装配（父仓技能 06 §4.2）需要的「extras 变更触发经典循环内重建」上游**仍未提供**（重建条件仍是 `tools_updated` 与子目录 hints），将作为新的薄 patch 单独登记，不混入本次同步。
@@ -1287,8 +1287,9 @@ goose-provider-types = { git = "https://github.com/youngshunf/goose.git", rev = 
 
 | `hasn-node` 分支 | 钉的 rev | 说明 |
 |---|---|---|
-| `main` | `855d73e4` | 上游同步到 `96009644` ＋ 薄 patch `#1`（2026-09-23 现读 `main` 的 `modules/runtime-host/goose/Cargo.toml`） |
-| `feat/goose-k8-coding` | `hasn` 上 `#2` 登记那一笔（**即本文件随之提交的那一笔**，写不进自己的 SHA——现读该分支的 `Cargo.toml`） | 再加薄 patch `#2`（`K8-1b`），**未合回 main** |
+| `main` | `55a4452e` | 2026-10-01 第二次上游同步（上游 `bab8ff64`）＋ 薄 patch `#1`–`#6`（现读 `main` 的 `modules/runtime-host/goose/Cargo.toml`，提交 `5ec1de657`） |
+
+📌 **2026-10-01 订正**：本表原两行（`main` 钉 `855d73e4`、`feat/goose-k8-coding` 钉 `#2` 登记那笔）是 2026-09-23 的事实，之后 `main` 先后钉过 `8f1ef1db`…`08942a41`，现为 `55a4452e`；`feat/goose-k8-coding` 已合回。
 
 📌 **2026-09-23 订正**：本表原写 `main` 钉 `af1e505e`、`#1` 那两条分支钉 `4f1b751c`——
 那是 `K2b` 刚落地时的事实；此后 rev-bump 片已把 `main` 推到 `855d73e4`（含 `#1`），
