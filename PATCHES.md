@@ -1349,7 +1349,7 @@ goose-provider-types = { git = "https://github.com/youngshunf/goose.git", rev = 
 
 | `hasn-node` 分支 | 钉的 rev | 说明 |
 |---|---|---|
-| `main` | `55a4452e` | 2026-10-01 第二次上游同步（上游 `bab8ff64`）＋ 薄 patch `#1`–`#6`（现读 `main` 的 `modules/runtime-host/goose/Cargo.toml`，提交 `5ec1de657`） |
+| `main` | `5b05e831` | 薄 patch `#7`（S0）合并提交，其下为 2026-10-01 第二次上游同步（上游 `bab8ff64`）＋ 薄 patch `#1`–`#6`（现读 `main` 的 `modules/runtime-host/goose/Cargo.toml`，合并提交 `55a714da2`） |
 
 📌 **2026-10-01 订正**：本表原两行（`main` 钉 `855d73e4`、`feat/goose-k8-coding` 钉 `#2` 登记那笔）是 2026-09-23 的事实，之后 `main` 先后钉过 `8f1ef1db`…`08942a41`，现为 `55a4452e`；`feat/goose-k8-coding` 已合回。
 
