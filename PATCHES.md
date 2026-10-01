@@ -109,6 +109,18 @@ relay 404 重试耗尽后，经典循环把 `ProviderError` 压成一条普通 a
 由 `hasn-node` 真实 E2E `E4-2` 暴露（「ask 恰 1 次」因一条多余的失败调用而红）。
 本片只改 fork，不合回 `hasn`、不推送；⛔ 不记作主人单独批准，⛔ 不构成放宽。
 
+### 2026-10-01：`#7` 施工登记
+
+施工分支 `feat/expert-s0-extras-rebuild`；worktree
+`/Users/mac/openclaw-workspace/huanxing/huanxing-project/.worktrees/goose-fork-extras-rebuild`；
+起点 `fc0b6ca7`（`hasn`，内含 `hasn-node` `main` 当前钉的 `55a4452e`）。
+由父仓施工文档 `身份与权限/实施/04-分身身份与专家能力解耦施工文档.md` 切片 **S0** 提出：
+主人裁决「分身在工作会话里 `hasn.session.expert.select` 后，专家提示词与技能**同一轮下一次推理**
+就生效」（技能体系 06 §4.2）。缺口原登记在 `hasn-node`
+`modules/runtime-host/goose/src/prompt.rs` 头注。⛔ 不记作主人对「内核逻辑可改」的单条裁决，
+⛔ 不构成放宽；落地依据是上述行为裁决本身——不打 patch 就只能做「下一次 `reply()` 生效」，
+那与裁决不符。
+
 ## 改动登记
 
 | # | 改动点 | 类别 | 理由 | 上游回馈可能性 |
@@ -119,6 +131,7 @@ relay 404 重试耗尽后，经典循环把 `ProviderError` 压成一条普通 a
 | 4 | `crates/goose-providers/src/openai_compatible.rs`：实例级 `with_retry_config(RetryConfig)` 覆写 `Provider::retry_config()`；`api_client.rs`：实例级 `with_no_transport_retry()` 在所有客户端重建时复施 reqwest `retry::never()`；测试覆盖 provider、真实本地 HTTP/SSE、真实 h2 NACK 与经典空轮反例 | 内核接入的窄公开挂点（本任务依据父仓 §2 非幂等 POST 不自动重放及 §1 零假回落；**没有**主人另行单条裁决） | 本地 relay chat POST 未见稳定去重键与服务端保证；缺省 provider 额外重试 3 次，Agent 首流项前可额外重发，reqwest 0.13.5 默认协议 NACK 还可重发 2 次。两处逐实例装配，其他 provider/默认实例保持原行为；⚠️ 经典 200 空轮和认证刷新仍有独立重发，故 #4 **不等于**全链零自动重放 | 🟢 **高**。通用嵌入方按实例选重试策略，默认零变化；见下方 PR 草稿，尚未向上游提交 |
 | 5 | `crates/goose/src/agents/agent.rs`：只在经典循环 `RetryResult::Skipped` 的空轮分支检查现有 `provider.retry_config().max_retries == 0`；首次空轮即通过既有 `persist_and_push_message_with_id` 发出并保存 `Message::assistant().with_error(MessageErrorKind::Other, EMPTY_TURN_MESSAGE)`，不再调用第二次 `Provider::stream`；原 #4 反例翻面并增默认及状态机对照 | 内核逻辑（据父仓 §2 非幂等 POST 不重发及 §1 零 fake 实施，**没有**主人另行单条裁决） | 200 成功空轮也是已发送的非幂等请求；零重试实例原额外发 3 次，且普通 assistant 文本被当正常答复。现闭集里 `Authentication`、`ContextLengthExceeded`、`CreditsExhausted` 均与事实不符，因此取 `Other`；`with_error` 为主人可见、模型不可见，错误在事件流和会话中均可判 | 🟢 **高**。与宿主业务无关，复用现有配置和错误消息接口；上游 PR 仅备材料，尚未对外提交 |
 | 6 | `crates/goose/src/agents/extension_manager/mod.rs`：`recover_mangled_tool_name` 多认一种形态——`sanitize_function_name(广告名) == 模型发出的名字`（复用 `goose-provider-types/src/formats/openai.rs` 序列化时的**同一个**函数，零新正则）；同时把「发出名本身已广告」从 `continue` 改成 `return None`。生产 **+16 / −2**（含一行 `use`）；测试在同文件、`agents/reply_parts.rs`、`agents/state_machine/ops_llm.rs` 各一条 | 内核逻辑（据 E2E 缺陷修复实施，**没有**主人另行单条裁决） | 广告名含点（`hasn__hasn.tool.call`）时 `format_tools` 原样下发，而 OpenAI 系格式回放历史 assistant `tool_calls` 经 `sanitize_function_name` 变成 `hasn__hasn_tool_call`；模型照抄历史写法再发出，经典循环 `categorize_tool_requests` 判 `not advertised`、状态机同样认不回，白费一步并留下一条失败调用 | 🟢 **高**。任何含 `.`/`:` 等字符的 MCP 工具名都会命中，与唤星业务零耦合；wire 形态零变化。PR 材料见下节，尚未对外提交 |
+| 7 | `crates/goose/src/agents/prompt_manager.rs`：`PromptManager` 新增 extras **内容版本** `system_prompt_extras_revision`（`add_system_prompt_extra` 只在正文真的变了才写并 +1、`remove_system_prompt_extra` 只在真的摘掉一格才 +1，＋ 只读访问器）；`agents/agent.rs`：经典 reply 循环在建 system prompt 前记下版本，工具执行之后与既有 `has_new_hints` 并列判 `extras_changed`，**复用既有** `prepare_tools_and_prompt` 重建，`tools_updated` 那一支同步记版本；`Agent` 新增私有 `system_prompt_extras_revision()`。测试在 `prompt_manager.rs` 一条单测与新文件 `agents/state_machine/tests/system_prompt_extras_lifecycle.rs`（模块登记在 `tests/mod.rs`） | 内核逻辑（据主人「专家同轮下一次推理生效」行为裁决实施，**没有**主人另行「内核可改」单条裁决） | 经典循环只在 `tools_updated` 或新子目录 hints 时循环内重建 system prompt，嵌入方在工具执行期间经公开的 `extend_system_prompt`/`remove_system_prompt_extra` 改了 extras，要到下一次 `reply()` 才生效；状态机路径每次推理前本就重建（`inference_preparation.rs`），两条路行为不一致 | 🟢 **高**。让公开 extras API 在同一轮内生效是通用语义，缺省（不改 extras）行为逐字节不变，与唤星业务零耦合。PR 材料见下节，尚未对外提交 |
 
 > 加一条 patch 就在上表加一行，**不要攒着**。评审判据是：
 > 这张表的行数 == `git diff upstream/main...hasn` 里非裁剪类改动的处数。
@@ -371,6 +384,36 @@ session::session_manager::tests::create_session`）：
 快照里有 `## code_execution` 一节，而那个平台扩展挂在 `code-mode` feature 后面
 （`platform_extensions/mod.rs:4`/`:146`），`cargo test -p goose` 不带它 ⇒ 快照缺那一节。
 差异只有那一节；⚠️ 未在 `--features code-mode` 下复跑（`not_run`）。
+
+### `#7` 的最小性、行为与证伪
+
+- **复用既有重建路径**：触发后走的就是 `tools_updated` / 子目录 hints 那两支在用的
+  `prepare_tools_and_prompt`，⛔ 没有另写一套 system prompt 组装。
+- **版本只认内容**：`add_system_prompt_extra` 同 key 同正文 ⇒ 不写不推进（`IndexMap::insert`
+  对已有 key 本就保位，跳过写入与原行为逐字节等价）；`remove_system_prompt_extra` 摘不到 ⇒ 不推进。
+  子目录 hints 直接写表、不推进版本——它照旧由 `has_new_hints` 触发，两条触发并列。
+- **先取版本后建**：`reply_internal` 在 `prepare_reply_context` **之前**取版本，
+  `tools_updated` 与本支重建前同样先取。并发写入落在「取版本」与「建」之间时最多多重建一次，
+  ⛔ 不会漏建。
+- **状态机路径**：每次推理前本就 `build_system_prompt`，不需改动；新文件里一条状态机对照用例锁住两路行为一致
+  （上游 `AGENTS.md`「两条循环须同改同测」）。
+- **继承的上游行为（未改）**：循环内重建不再拼 `load_project_instructions` 的项目附言
+  （上游只在 `reply()` 开头拼一次）；`tools_updated`/子目录 hints 两支同样如此。本 patch 让这格多一个
+  触发条件，嵌入方若设 goose `project_id` 需留意；`hasn-node` 不设。
+- **判定面**：provider 真收到的 system prompt（`DummyApi` 请求体）。「没重建」靠测试扩展的
+  `get_instructions` 每读一次换 `<build-N>`——内核只在建 system prompt 时读它。
+- **先红后绿 / 变异**（`CARGO_TARGET_DIR=/Volumes/ExtraData/cargo-targets/goose-fork-extras-rebuild-1244434e97c0`，
+  feature 集同下方 2026-10-01 验证表，`RUST_MIN_STACK=8388608`）：
+  经典循环条件改成 `has_new_hints || (false && extras_changed)` ⇒
+  `classic_loop_rebuilds_system_prompt_within_the_turn_when_extras_change` 红（rc=101，第二次推理仍是旧专家），
+  其余绿；`add_system_prompt_extra` 的判等改成 `true || …`（同正文也推进）⇒
+  `extras_revision_moves_only_when_extras_content_changes` 与
+  `classic_loop_keeps_system_prompt_when_extras_are_rewritten_unchanged` 红（rc=101）。还原后 4 条全绿。
+- **影响面**（2026-10-01 本机）：`RUST_MIN_STACK=8388608 cargo test -p goose --lib --no-default-features
+  --features rustls-tls,code-mode,tree-sitter,live-voice,scheduler,platform-apps,chat-recall,acp-http`
+  `ok. 2356 passed; 0 failed`（rc=0）；同 feature 集 `cargo clippy -p goose --lib --tests -- -D warnings` rc=0
+  （有 `Checking goose` 行）；`cargo fmt --all -- --check`、`git diff --check` rc=0；消费形态
+  `cargo check -p goose -p goose-providers -p goose-provider-types --lib --no-default-features` rc=0。
 
 ## 上游 PR 材料（⚠️ 尚未提交）
 
@@ -857,6 +900,25 @@ leaving a failed tool call. recover_mangled_tool_name already canonicalizes othe
 known manglings; it should also accept sanitize_function_name(advertised) ==
 emitted, reusing the same function the formatter uses. Ambiguous matches stay
 unrecovered. No wire-format change.
+```
+
+### `#7` 的上游 PR 材料草稿（⚠️ 尚未提交）
+
+⛔ 只备本地材料，不对外发送；提 PR 前须先有 Board 状态 **Ready** 的 issue，
+新增中文注释译为英文，仅摘取 `#7` 差异。
+
+```text
+Title: Rebuild the system prompt mid-reply when system prompt extras change
+
+Agent::extend_system_prompt / remove_system_prompt_extra are public, but the
+legacy reply loop only rebuilds the system prompt inside a reply when tools were
+updated or new subdirectory hints were loaded. An embedder that changes extras
+while a tool runs (e.g. a tool that switches the agent's persona or skill index)
+only sees the change on the next reply() call, while the state-machine path
+already rebuilds before every inference. PromptManager now keeps a content
+revision of extras (bumped only when an entry is actually added, changed or
+removed); the legacy loop compares it after tool execution and reuses
+prepare_tools_and_prompt to rebuild. Unchanged extras do not trigger a rebuild.
 ```
 
 ## 待回馈上游

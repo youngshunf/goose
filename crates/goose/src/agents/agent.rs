@@ -2507,6 +2507,9 @@ impl Agent {
         cancel_token: Option<CancellationToken>,
         reply_span: tracing::Span,
     ) -> Result<BoxStream<'_, Result<AgentEvent>>> {
+        // 唤星 `PATCHES.md` `#7`：先取 extras 内容版本再建 system prompt。先取后建只会
+        // 多重建一次，⛔ 不会漏掉「建完之后才写进来」的变更。
+        let mut built_extras_revision = self.system_prompt_extras_revision().await;
         let context = self
             .prepare_reply_context(&session.id, conversation, session.working_dir.as_path())
             .await?;
@@ -3358,6 +3361,7 @@ impl Agent {
                 can_drain_pending_steers = true;
 
                 if tools_updated {
+                    built_extras_revision = self.system_prompt_extras_revision().await;
                     (tools, toolshim_tools, system_prompt, _) =
                         self.prepare_tools_and_prompt(&session_config.id, &session.working_dir).await?;
                 }
@@ -3368,7 +3372,12 @@ impl Agent {
                         .lock()
                         .await
                         .load_subdirectory_hints(&working_dir);
-                    if has_new_hints && !tools_updated {
+                    // 唤星 `PATCHES.md` `#7`：嵌入方在本轮里（例如工具执行期间）改了 extras，
+                    // 同一轮的下一次推理就用新的 system prompt；extras 没变则不重建。
+                    let extras_changed =
+                        self.system_prompt_extras_revision().await != built_extras_revision;
+                    if (has_new_hints || extras_changed) && !tools_updated {
+                        built_extras_revision = self.system_prompt_extras_revision().await;
                         (tools, toolshim_tools, system_prompt, _) =
                             self.prepare_tools_and_prompt(&session_config.id, &session.working_dir).await?;
                     }
@@ -3670,6 +3679,14 @@ impl Agent {
     pub async fn remove_system_prompt_extra(&self, key: &str) {
         let mut prompt_manager = self.prompt_manager.lock().await;
         prompt_manager.remove_system_prompt_extra(key);
+    }
+
+    /// extras 内容版本（唤星 `PATCHES.md` `#7`），见 [`PromptManager::system_prompt_extras_revision`]。
+    async fn system_prompt_extras_revision(&self) -> u64 {
+        self.prompt_manager
+            .lock()
+            .await
+            .system_prompt_extras_revision()
     }
 
     pub async fn set_goal(&self, goal: Option<String>) {

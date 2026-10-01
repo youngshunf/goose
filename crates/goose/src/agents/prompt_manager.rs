@@ -21,6 +21,10 @@ pub struct PromptManager {
     subdirectory_hint_tracker: SubdirectoryHintTracker,
     /// 嵌入方显式指定的上下文文件名。`None` ⇒ 读全局配置的 `CONTEXT_FILE_NAMES`（原行为）。
     context_file_names: Option<Vec<String>>,
+    /// 经 `add_system_prompt_extra` / `remove_system_prompt_extra` 写入的 extras **内容版本**
+    /// （唤星 `PATCHES.md` `#7`）：内容真的变了才 +1，同 key 同正文重写不动它。
+    /// 经典 reply 循环比对它决定是否在**同一轮**的下一次推理前重建 system prompt。
+    system_prompt_extras_revision: u64,
 }
 
 impl Default for PromptManager {
@@ -193,6 +197,7 @@ impl PromptManager {
             current_date_timestamp: Utc::now().format("%Y-%m-%d %H:00 %:z").to_string(),
             subdirectory_hint_tracker: SubdirectoryHintTracker::new(),
             context_file_names: None,
+            system_prompt_extras_revision: 0,
         }
     }
 
@@ -226,17 +231,29 @@ impl PromptManager {
             current_date_timestamp: dt.format("%Y-%m-%d %H:%M:%S %:z").to_string(),
             subdirectory_hint_tracker: SubdirectoryHintTracker::new(),
             context_file_names: None,
+            system_prompt_extras_revision: 0,
         }
     }
 
     /// Add an additional instruction to the system prompt with a key
     /// Using the same key will replace the previous instruction
     pub fn add_system_prompt_extra(&mut self, key: String, instruction: String) {
-        self.system_prompt_extras.insert(key, instruction);
+        // 同 key 同正文 ⇒ 什么都不变（`IndexMap::insert` 本就保位），不推进版本。
+        if self.system_prompt_extras.get(&key) != Some(&instruction) {
+            self.system_prompt_extras.insert(key, instruction);
+            self.system_prompt_extras_revision += 1;
+        }
     }
 
     pub fn remove_system_prompt_extra(&mut self, key: &str) {
-        self.system_prompt_extras.shift_remove(key);
+        if self.system_prompt_extras.shift_remove(key).is_some() {
+            self.system_prompt_extras_revision += 1;
+        }
+    }
+
+    /// extras 内容版本（唤星 `PATCHES.md` `#7`）。只比较相等性，不承诺具体数值。
+    pub fn system_prompt_extras_revision(&self) -> u64 {
+        self.system_prompt_extras_revision
     }
 
     pub fn record_tool_arguments(
@@ -445,6 +462,42 @@ mod tests {
 
         assert!(!result.contains("Agent instruction"));
         assert!(result.contains("Project instruction"));
+    }
+
+    /// 唤星 `PATCHES.md` `#7`：extras 内容版本只在内容真的变了时推进。
+    #[test]
+    fn extras_revision_moves_only_when_extras_content_changes() {
+        let mut manager = PromptManager::new();
+        let start = manager.system_prompt_extras_revision();
+
+        manager.add_system_prompt_extra("expert".to_string(), "A".to_string());
+        let after_add = manager.system_prompt_extras_revision();
+        assert_ne!(after_add, start, "新增一格必须推进版本");
+
+        manager.add_system_prompt_extra("expert".to_string(), "A".to_string());
+        assert_eq!(
+            manager.system_prompt_extras_revision(),
+            after_add,
+            "同 key 同正文重写不得推进版本"
+        );
+
+        manager.add_system_prompt_extra("expert".to_string(), "B".to_string());
+        let after_replace = manager.system_prompt_extras_revision();
+        assert_ne!(after_replace, after_add, "同 key 换正文必须推进版本");
+
+        manager.remove_system_prompt_extra("absent");
+        assert_eq!(
+            manager.system_prompt_extras_revision(),
+            after_replace,
+            "撤一个不存在的 key 不得推进版本"
+        );
+
+        manager.remove_system_prompt_extra("expert");
+        assert_ne!(
+            manager.system_prompt_extras_revision(),
+            after_replace,
+            "真的撤掉一格必须推进版本"
+        );
     }
 
     #[test]
