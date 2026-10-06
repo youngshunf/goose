@@ -393,7 +393,7 @@ pub(crate) async fn stream_response_from_provider(
     debug!("WAITING_LLM_STREAM_START");
     let stream_result = crate::session_context::with_session_id(
         Some(session_id.clone()),
-        provider.stream(
+        provider.stream_main(
             &model_config,
             system_prompt.as_str(),
             messages_for_provider.messages(),
@@ -457,7 +457,7 @@ pub(crate) async fn stream_response_from_provider(
 
                         stream = match crate::session_context::with_session_id(
                             Some(session_id.clone()),
-                            provider.stream(
+                            provider.stream_main(
                                 &model_config,
                                 system_prompt.as_str(),
                                 messages_for_provider.messages(),

@@ -522,6 +522,18 @@ pub trait Provider: MaybeSend + MaybeSync {
         tools: &[Tool],
     ) -> Result<MessageStream, ProviderError>;
 
+    /// 仅主推理入口调用；辅助 stream/complete 不携带主请求用途见证。
+    /// 默认委托原 stream，普通 provider 无需实现请求级宿主回执。
+    async fn stream_main(
+        &self,
+        model_config: &ModelConfig,
+        system: &str,
+        messages: &[Message],
+        tools: &[Tool],
+    ) -> Result<MessageStream, ProviderError> {
+        self.stream(model_config, system, messages, tools).await
+    }
+
     async fn complete(
         &self,
         model_config: &ModelConfig,
