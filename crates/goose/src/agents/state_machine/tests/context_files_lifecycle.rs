@@ -26,7 +26,6 @@ use tokio_util::sync::CancellationToken;
 use super::calculator_extension::{CalculatorExtension, ADD};
 use super::dummy_api::{DummyApi, ProviderFeatures};
 use crate::agents::extension::ExtensionConfig;
-use crate::agents::mcp_client::McpClientTrait;
 use crate::agents::{Agent, AgentConfig, GoosePlatform, SessionConfig};
 use crate::config::permission::PermissionManager;
 use crate::config::GooseMode;
@@ -87,6 +86,7 @@ async fn hint_markers_per_inference(
     )?;
     let provider: Arc<dyn Provider> = Arc::new(
         goose_providers::openai::OpenAiProviderBuilder::new(api_client)
+            .base_path("chat/completions")
             .name("openai")
             .build(),
     );
@@ -129,7 +129,6 @@ async fn hint_markers_per_inference(
     agent
         .extension_manager
         .add_client(
-            "calculator".to_string(),
             ExtensionConfig::Platform {
                 name: "calculator".to_string(),
                 description: "Stateful test calculator".to_string(),
@@ -138,7 +137,7 @@ async fn hint_markers_per_inference(
                 available_tools: vec![],
             },
             calculator.clone(),
-            calculator.get_info().cloned(),
+            None,
         )
         .await;
 

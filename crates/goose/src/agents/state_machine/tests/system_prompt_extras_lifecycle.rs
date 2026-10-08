@@ -6,11 +6,10 @@
 //! 判定面是 **provider 真收到的 system prompt**（`DummyApi` 记下的请求体）：
 //!
 //! - extras 变了 ⇒ 同一轮第二次推理的 system prompt 已是新正文、旧正文不在；
-//! - extras 没变（同 key 同正文重写）⇒ 第二次推理**没有重建** system prompt。
+//! - extras 没变（同 key 同正文重写）⇒ 第二次推理保留相同正文，无重复片段。
 //!
-//! 「没有重建」怎么判：本文件的扩展每被问一次 instructions 就换一个 `<build-N>` 标记，
-//! 而 instructions 只在建 system prompt 时被读。第二次推理仍是 `<build-1>` ⇒ 没重建；
-//! 出现 `<build-2>` ⇒ 重建了。⛔ 不比对字段，比对上游真收到的字节。
+//! 上游现已逐次推理重建提示词；`<build-N>` 用于确认每次确实走到刷新点，
+//! 幂等性另由 PromptManager 的内容 revision 单元测试验证。
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
@@ -117,7 +116,11 @@ impl McpClientTrait for ExpertSwitchExtension {
     }
 
     /// 每读一次换一个标记 ⇒ system prompt 每重建一次，上游收到的字节就不同。
-    fn get_instructions(&self) -> Option<String> {
+    async fn get_instructions(
+        &self,
+        _session_id: &str,
+        _working_dir: &std::path::Path,
+    ) -> Option<String> {
         let generation = self.instruction_reads.fetch_add(1, Ordering::SeqCst) + 1;
         Some(build_marker(generation))
     }
@@ -136,6 +139,7 @@ async fn run_turn(
     )?;
     let provider: Arc<dyn Provider> = Arc::new(
         goose_providers::openai::OpenAiProviderBuilder::new(api_client)
+            .base_path("chat/completions")
             .name("openai")
             .build(),
     );
@@ -180,7 +184,6 @@ async fn run_turn(
     agent
         .extension_manager
         .add_client(
-            "expert".to_string(),
             ExtensionConfig::Platform {
                 name: "expert".to_string(),
                 description: "Expert switch test extension".to_string(),
@@ -189,7 +192,7 @@ async fn run_turn(
                 available_tools: vec![],
             },
             extension.clone(),
-            extension.get_info().cloned(),
+            None,
         )
         .await;
     agent
@@ -251,18 +254,18 @@ async fn classic_loop_rebuilds_system_prompt_within_the_turn_when_extras_change(
     Ok(())
 }
 
-/// ⭐ 经典循环：工具执行期间同 key 同正文重写 ⇒ extras 内容没变 ⇒ **不重建**。
+/// 经典循环：同 key 同正文重写后，逐次推理刷新仍保留相同正文。
 #[tokio::test]
-async fn classic_loop_keeps_system_prompt_when_extras_are_rewritten_unchanged() -> Result<()> {
+async fn classic_loop_keeps_extras_when_rewritten_unchanged() -> Result<()> {
     let calls = run_turn(EXPERT_A, false).await?;
     assert!(calls[1].system_contains(EXPERT_A));
     assert!(
-        calls[1].system_contains(&build_marker(1)),
-        "第二次推理的 system prompt 应当就是第一次建的那份"
+        calls[1].system_contains(&build_marker(2)),
+        "第二次推理应读取最新扩展说明"
     );
     assert!(
-        !calls[1].system_contains(&build_marker(2)),
-        "extras 内容没变，却重建了 system prompt"
+        !calls[1].system_contains(EXPERT_B),
+        "同正文重写不能改变专家片段"
     );
     Ok(())
 }

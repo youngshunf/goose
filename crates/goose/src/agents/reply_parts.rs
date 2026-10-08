@@ -10,9 +10,10 @@ use tracing::debug;
 
 use super::super::agents::Agent;
 use super::gen_ai_telemetry;
-use crate::agents::extension_manager::{get_tool_owner, recover_mangled_tool_name};
+use crate::agents::extension_manager::{get_tool_owner, recover_mangled_tool_name, ExtensionLease};
 #[cfg(feature = "code-mode")]
 use crate::agents::platform_extensions::code_execution;
+use crate::agents::state_machine::ops_recipe;
 use crate::config::{Config, GooseMode};
 use crate::conversation::message::{Message, MessageContent, MessageUsage, ToolRequest};
 use crate::conversation::{fix_conversation, merge_consecutive_messages_for_request, Conversation};
@@ -24,6 +25,7 @@ use crate::providers::toolshim::{
     augment_message_with_selected_tool_interpreter, convert_tool_messages_to_text,
     modify_system_prompt_for_tool_json, sanitize_residual_markers,
 };
+use crate::session::Session;
 use goose_providers::conversation::token_usage::{ProviderStats, ProviderUsage, Usage};
 use goose_providers::model::ModelConfig;
 use rmcp::model::{ErrorData, Tool};
@@ -72,10 +74,10 @@ fn coerce_value(s: &str, schema: &Value) -> Value {
                 if let Value::String(type_name) = t {
                     match type_name.as_str() {
                         "number" | "integer" if s.parse::<f64>().is_ok() => {
-                            return try_coerce_number(s)
+                            return try_coerce_number(s);
                         }
                         "boolean" if matches!(s.to_lowercase().as_str(), "true" | "false") => {
-                            return try_coerce_boolean(s)
+                            return try_coerce_boolean(s);
                         }
                         _ => continue,
                     }
@@ -197,33 +199,36 @@ fn ensure_unique_tool_names(tools: &[Tool]) -> Result<()> {
 impl Agent {
     pub async fn prepare_tools_and_prompt(
         &self,
-        session_id: &str,
-        working_dir: &std::path::Path,
-    ) -> Result<(Vec<Tool>, Vec<Tool>, String, ModelConfig)> {
-        // 严格嵌入模式不能把工具目录故障伪装成空目录；CLI 继续保留兼容降级。
-        let tools = if self.config.strict_tool_list {
-            self.list_tools_strict(session_id, None).await?
-        } else {
-            self.list_tools(session_id, None).await
-        };
+        fallback_session: &Session,
+    ) -> Result<(
+        Session,
+        Arc<ExtensionLease>,
+        Vec<Tool>,
+        Vec<Tool>,
+        String,
+        ModelConfig,
+    )> {
+        let (session, lease) = self
+            .extension_manager
+            .current_session_snapshot(fallback_session)
+            .await;
+        let lease = Arc::new(lease);
+        // 租约继承 strict_tool_list，严格嵌入模式不会把目录故障伪装成空目录。
+        let mut tools = lease.tools().await?;
+        if let Some(final_output_tool) = ops_recipe::final_output_tool(&session)? {
+            tools.push(final_output_tool.tool());
+        }
         ensure_unique_tool_names(&tools)?;
 
         #[cfg(feature = "code-mode")]
-        let code_execution_active = self
-            .extension_manager
-            .is_extension_enabled(code_execution::EXTENSION_NAME)
-            .await;
+        let code_execution_active = lease.is_enabled(code_execution::EXTENSION_NAME);
         #[cfg(not(feature = "code-mode"))]
         let code_execution_active = false;
 
         let tools = prepare_inference_tools(tools, code_execution_active);
 
-        // Prepare system prompt
-        let extensions_info = self
-            .extension_manager
-            .get_extensions_info(working_dir)
-            .await;
-        let model_config = self.effective_model_config_for_session(session_id).await?;
+        let extensions_info = lease.instructions().await;
+        let model_config = self.effective_model_config_for_session(&session.id).await?;
 
         let goose_mode = *self.current_goose_mode.lock().await;
 
@@ -234,16 +239,25 @@ impl Agent {
         let prompt_manager = self.prompt_manager.lock().await;
         let system_prompt = prompt_manager
             .builder()
+            .with_session(&session)
+            .with_prompt_extras(ops_recipe::recipe_prompt_parts(&session)?)
             .with_extensions(extensions_info.into_iter())
             .with_code_execution_mode(code_execution_active)
-            .with_hints(working_dir)
+            .with_hints(&session.working_dir)
             .with_goose_mode(goose_mode)
             .build();
 
         let (tools, toolshim_tools, system_prompt) =
             prepare_tools_for_provider(tools, system_prompt, &model_config);
 
-        Ok((tools, toolshim_tools, system_prompt, model_config))
+        Ok((
+            session,
+            lease,
+            tools,
+            toolshim_tools,
+            system_prompt,
+            model_config,
+        ))
     }
 }
 
@@ -1342,8 +1356,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn categorize_tool_requests_keeps_thinking_when_not_previously_streamed() {
+    #[tokio::test]
+    async fn categorize_tool_requests_keeps_thinking_when_not_previously_streamed() {
         let agent = crate::agents::Agent::new();
         let tool = Tool::new("test_tool", "a test tool", object!({ "type": "object" }));
         let mut response = Message::assistant()
@@ -1370,8 +1384,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn categorize_tool_requests_drops_replayed_thinking_after_streaming() {
+    #[tokio::test]
+    async fn categorize_tool_requests_drops_replayed_thinking_after_streaming() {
         let agent = crate::agents::Agent::new();
         let tool = Tool::new("test_tool", "a test tool", object!({ "type": "object" }));
         let response = Message::assistant()
@@ -1392,8 +1406,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn categorize_tool_requests_excludes_assistant_only_text_from_user_events() {
+    #[tokio::test]
+    async fn categorize_tool_requests_excludes_assistant_only_text_from_user_events() {
         let agent = crate::agents::Agent::new();
         let assistant_only = TextContent::new("assistant-only")
             .with_annotations(Annotations::default().with_audience(vec![Role::Assistant]));
@@ -1412,8 +1426,8 @@ mod tests {
             .any(|content| matches!(content, MessageContent::Thinking(_))));
     }
 
-    #[test]
-    fn categorize_tool_requests_skips_externally_dispatched_and_preserves_marker() {
+    #[tokio::test]
+    async fn categorize_tool_requests_skips_externally_dispatched_and_preserves_marker() {
         // External requests must (1) survive coercion with goose.external_dispatch
         // intact, (2) be excluded from dispatch, (3) stay in filtered_message.
         use crate::conversation::message::TOOL_META_EXTERNAL_DISPATCH_KEY;
@@ -1476,8 +1490,8 @@ mod tests {
             .is_some_and(|request| request.tool_call.is_ok()));
     }
 
-    #[test]
-    fn categorize_tool_requests_rejects_unadvertised_executable_tools() {
+    #[tokio::test]
+    async fn categorize_tool_requests_rejects_unadvertised_executable_tools() {
         let agent = crate::agents::Agent::new();
         let response = Message::assistant()
             .with_tool_request(
@@ -1506,8 +1520,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn categorize_tool_requests_dispatches_advertised_tools() {
+    #[tokio::test]
+    async fn categorize_tool_requests_dispatches_advertised_tools() {
         let agent = crate::agents::Agent::new();
         let regular_tool = Tool::new(
             "regular_tool",
@@ -1548,8 +1562,8 @@ mod tests {
         assert_eq!(tool_requests.len(), 3);
     }
 
-    #[test]
-    fn categorize_tool_requests_canonicalizes_mangled_unprefixed_tool_name() {
+    #[tokio::test]
+    async fn categorize_tool_requests_canonicalizes_mangled_unprefixed_tool_name() {
         // GLM's documented reproduction (#9486): a default Developer-extension
         // tool is advertised unprefixed ("shell"), owner only in metadata, and
         // the model emits "developer.shell". This must be rewritten to the
@@ -1590,8 +1604,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn categorize_tool_requests_canonicalizes_mangled_non_extension_manager_tool_name() {
+    #[tokio::test]
+    async fn categorize_tool_requests_canonicalizes_mangled_non_extension_manager_tool_name() {
         // recipe__final_output is appended by Agent::list_tools outside the
         // extension manager (see #9486 review); it must recover the same way.
         let agent = crate::agents::Agent::new();
@@ -1693,8 +1707,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn categorize_tool_requests_rejects_unrecoverable_unadvertised_name() {
+    #[tokio::test]
+    async fn categorize_tool_requests_rejects_unrecoverable_unadvertised_name() {
         let agent = crate::agents::Agent::new();
         let tool = Tool::new(
             "shell",
@@ -1723,8 +1737,8 @@ mod tests {
         assert!(tool_call.message.contains("totally_unknown_tool"));
     }
 
-    #[test]
-    fn categorize_tool_requests_dedups_duplicate_ids_in_provider_order() {
+    #[tokio::test]
+    async fn categorize_tool_requests_dedups_duplicate_ids_in_provider_order() {
         // A malformed provider repeats id "dup". The first occurrence wins, the
         // later duplicate is dropped from both the dispatch bucket and the
         // filtered (history) message, and unique ids are kept.

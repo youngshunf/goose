@@ -1,4 +1,4 @@
-use crate::agents::extension_manager::ExtensionManager;
+use crate::agents::extension_manager::{ExtensionLease, ExtensionManager};
 use crate::conversation::message::{Message, MessageMetadata};
 use crate::conversation::{CURRENT_TIME_TAG, TURN_CONTEXT_TAG, WORKING_DIRECTORY_TAG};
 use std::path::{Path, PathBuf};
@@ -47,18 +47,24 @@ pub(super) async fn compute_compaction_info(
     let session_model_config = session
         .as_ref()
         .and_then(|session| session.model_config.clone());
-    let context_limit = if let Some(model_config) = session_model_config.as_ref() {
-        let provider = extension_manager.get_provider().lock().await.clone();
-        match provider {
-            Some(provider) => {
-                crate::context_limit::get_context_limit(provider.as_ref(), &model_config.model_name)
-                    .await
-                    .ok()
+    let context_limit = match (session.as_ref(), session_model_config.as_ref()) {
+        (Some(session), Some(model_config)) => {
+            match extension_manager
+                .get_context()
+                .providers
+                .provider_for(session)
+                .await
+            {
+                Ok(provider) => crate::context_limit::get_context_limit(
+                    provider.as_ref(),
+                    &model_config.model_name,
+                )
+                .await
+                .ok(),
+                Err(_) => None,
             }
-            None => None,
         }
-    } else {
-        None
+        _ => None,
     };
     let total_tokens = session
         .as_ref()
@@ -69,18 +75,17 @@ pub(super) async fn compute_compaction_info(
     compaction_remaining_line(total_tokens, context_limit, compaction_threshold)
 }
 
-/// The turn's context block: composed once per turn, persisted as an
-/// agent-only user message, never moved or edited afterwards.
 pub async fn turn_context_message(
     session_id: &str,
     extension_manager: &ExtensionManager,
+    lease: &ExtensionLease,
     turns_taken: u32,
     max_turns: u32,
     turn_start: chrono::DateTime<chrono::Local>,
     compaction_info: Option<String>,
-) -> Option<Message> {
+) -> crate::agents::extension::ExtensionResult<Option<Message>> {
     if SKIP.with(|f| f.get()) {
-        return None;
+        return Ok(None);
     }
 
     let session = extension_manager
@@ -92,31 +97,43 @@ pub async fn turn_context_message(
     let session_model_config = session
         .as_ref()
         .and_then(|session| session.model_config.clone());
-    let context_limit = if let Some(model_config) = session_model_config.as_ref() {
-        let provider = extension_manager.get_provider().lock().await.clone();
-        match provider {
-            Some(provider) => {
-                crate::context_limit::get_context_limit(provider.as_ref(), &model_config.model_name)
-                    .await
-                    .ok()
+    let context_limit = match (session.as_ref(), session_model_config.as_ref()) {
+        (Some(session), Some(model_config)) => {
+            match extension_manager
+                .get_context()
+                .providers
+                .provider_for(session)
+                .await
+            {
+                Ok(provider) => crate::context_limit::get_context_limit(
+                    provider.as_ref(),
+                    &model_config.model_name,
+                )
+                .await
+                .ok(),
+                Err(_) => None,
             }
-            None => None,
         }
-    } else {
-        None
+        _ => None,
     };
     if should_skip_moim(context_limit) {
-        return None;
+        return Ok(None);
     }
 
-    let working_dir = session
-        .as_ref()
-        .map(|session| session.working_dir.clone())
+    let working_dir = lease
+        .working_dir()
+        .map(Path::to_path_buf)
+        .or_else(|| session.as_ref().map(|session| session.working_dir.clone()))
         .unwrap_or_else(|| PathBuf::from("."));
-    let mut parts = extension_manager.collect_moim_parts(session_id).await;
+    let mut parts = lease.moim().await?;
     parts.extend(compaction_info.map(|value| tag("compaction", &value)));
     parts.extend(turn_budget_part(turns_taken, max_turns));
-    turn_context_event(&working_dir, context_limit, parts, turn_start)
+    Ok(turn_context_event(
+        &working_dir,
+        context_limit,
+        parts,
+        turn_start,
+    ))
 }
 
 /// The state-machine variant: operations contribute the parts and the caller
@@ -221,10 +238,64 @@ fn turn_budget_part(turns_taken: u32, max_turns: u32) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agents::extension_manager::ExtensionSet;
+    use crate::agents::mcp_client::McpClientTrait;
+    use crate::agents::tool_execution::ToolCallContext;
+    use crate::config::ExtensionConfig;
+    use rmcp::model::{CallToolResult, InitializeResult, JsonObject, ListToolsResult};
+    use rmcp::ServiceError;
+    use std::sync::Arc;
+    use tokio_util::sync::CancellationToken;
+
+    struct MoimClient(&'static str);
+
+    #[async_trait::async_trait]
+    impl McpClientTrait for MoimClient {
+        async fn list_tools(
+            &self,
+            _session_id: &str,
+            _next_cursor: Option<String>,
+            _cancel_token: CancellationToken,
+        ) -> Result<ListToolsResult, ServiceError> {
+            Ok(ListToolsResult::default())
+        }
+
+        async fn call_tool(
+            &self,
+            _ctx: &ToolCallContext,
+            _name: &str,
+            _arguments: Option<JsonObject>,
+            _cancel_token: CancellationToken,
+        ) -> Result<CallToolResult, ServiceError> {
+            unreachable!()
+        }
+
+        fn get_info(&self) -> Option<&InitializeResult> {
+            None
+        }
+
+        async fn get_moim(
+            &self,
+            _session_id: &str,
+            _tools: &[rmcp::model::Tool],
+        ) -> Option<String> {
+            Some(self.0.to_string())
+        }
+    }
+
+    fn moim_extension() -> ExtensionConfig {
+        ExtensionConfig::Platform {
+            name: "context".to_string(),
+            description: String::new(),
+            display_name: None,
+            bundled: None,
+            available_tools: Vec::new(),
+        }
+    }
 
     async fn session_and_manager() -> (String, ExtensionManager, tempfile::TempDir) {
         let temp_dir = tempfile::tempdir().unwrap();
-        let em = ExtensionManager::new_without_provider(temp_dir.path().to_path_buf());
+        let em = ExtensionManager::with_data_dir(temp_dir.path().to_path_buf());
         let session = em
             .get_context()
             .session_manager
@@ -242,10 +313,13 @@ mod tests {
     #[tokio::test]
     async fn turn_context_message_is_an_agent_only_user_message() {
         let (session_id, em, _tmp) = session_and_manager().await;
+        let lease = em.current_lease(&session_id, None).await;
 
-        let message = turn_context_message(&session_id, &em, 0, 100, chrono::Local::now(), None)
-            .await
-            .expect("turn context should be produced");
+        let message =
+            turn_context_message(&session_id, &em, &lease, 0, 100, chrono::Local::now(), None)
+                .await
+                .unwrap()
+                .expect("turn context should be produced");
 
         assert_eq!(message.role, rmcp::model::Role::User);
         assert!(message.is_agent_visible());
@@ -259,13 +333,16 @@ mod tests {
     #[tokio::test]
     async fn turn_context_bytes_are_stable_for_a_turn() {
         let (session_id, em, _tmp) = session_and_manager().await;
+        let lease = em.current_lease(&session_id, None).await;
         let turn_start = chrono::Local::now();
 
-        let first = turn_context_message(&session_id, &em, 0, 100, turn_start, None)
+        let first = turn_context_message(&session_id, &em, &lease, 0, 100, turn_start, None)
             .await
+            .unwrap()
             .unwrap();
-        let second = turn_context_message(&session_id, &em, 0, 100, turn_start, None)
+        let second = turn_context_message(&session_id, &em, &lease, 0, 100, turn_start, None)
             .await
+            .unwrap()
             .unwrap();
 
         assert_eq!(
@@ -273,6 +350,45 @@ mod tests {
             second.content[0].as_text(),
             "the same turn inputs must render byte-identical blocks"
         );
+    }
+
+    #[tokio::test]
+    async fn turn_context_uses_the_inference_lease() {
+        let (session_id, em, _tmp) = session_and_manager().await;
+        em.add_client(moim_extension(), Arc::new(MoimClient("old context")), None)
+            .await;
+        let lease = em.current_lease(&session_id, None).await;
+        em.add_client(moim_extension(), Arc::new(MoimClient("new context")), None)
+            .await;
+
+        let message =
+            turn_context_message(&session_id, &em, &lease, 0, 100, chrono::Local::now(), None)
+                .await
+                .unwrap()
+                .unwrap();
+        let text = message.content[0].as_text().unwrap();
+
+        assert!(text.contains("old context"));
+        assert!(!text.contains("new context"));
+    }
+
+    #[tokio::test]
+    async fn turn_context_uses_the_leased_working_dir() {
+        let (session_id, em, _tmp) = session_and_manager().await;
+        let leased_working_dir = PathBuf::from("/leased/dir");
+        let lease = em
+            .resolve(&ExtensionSet::new(&session_id, Some(leased_working_dir), vec![]).unwrap())
+            .await;
+
+        let message =
+            turn_context_message(&session_id, &em, &lease, 0, 100, chrono::Local::now(), None)
+                .await
+                .unwrap()
+                .unwrap();
+        let text = message.content[0].as_text().unwrap();
+
+        assert!(text.contains("<working-directory>/leased/dir</working-directory>"));
+        assert!(!text.contains("<working-directory>/test/dir</working-directory>"));
     }
 
     #[test]

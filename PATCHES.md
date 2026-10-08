@@ -1338,6 +1338,47 @@ resolver 2 在只编 lib 时**不做 dev-dep 的 feature 合一** ⇒ `cargo che
 - 公开面（`Agent::reply`、`AgentConfig::new`、`extend_system_prompt`/`remove_system_prompt_extra`、`add_extension`、`list_tools`、`update_provider`、`submit_tool_confirmation`）签名本轮**未变**。
 - 📌 专家即时装配（父仓技能 06 §4.2）需要的「extras 变更触发经典循环内重建」上游**仍未提供**（重建条件仍是 `tools_updated` 与子目录 hints），将作为新的薄 patch 单独登记，不混入本次同步。
 
+### 2026-10-08：第三次上游同步（距上次 7 天）
+
+| 项 | 值 |
+|---|---|
+| 上游 HEAD | `9560429ff982bbfecec5094963e5f34696b63a1c`，`chore: remove scenario tests (#12759)` |
+| 上一基点 | `bab8ff641039c9cd3331121cd84a5c6045f365ca` |
+| 上游提交数 | 34 |
+| 上游版本与工具链 | `1.53.0` → `1.54.0`；上游 `channel` 升至 `1.99.0` |
+| 合并方式 | 在父仓 `.worktrees/goose-upstream-20261008`（`merge/goose-upstream-20261008`）合并验证，再快进主 clone 的 `hasn`；不重写已发布历史 |
+
+#### 上游变化与本地补丁迁移
+
+- **Provider 按会话管理**（#12745）：上游 `ProviderManager` 替代旧全局 provider 槽位。本地 `strict_tool_list`、`context_file_names` 保留；零重试空轮从当前会话 provider 读取配置。主请求的两处 `stream_main` 用途见证仍在。
+- **扩展按推理租约执行**（#12161、#12723）：目录、调用、资源与提示词使用同一租约快照。本地 F-3 的严格目录错误迁移到 `Extension → ToolCatalog → ExtensionLease → 两条推理循环`；严格模式的首屏或分页失败都具名传播，不缓存空或部分目录。租约工具与 moim 接口返回 `ExtensionResult`，Code Mode 和调用解析同样传播失败。CLI 未开启严格模式时保留上游既有降级行为。
+- **提示词来自会话记录并逐次推理重建**（#12730）：保留上游 session/recipe/project 输入，另外保留节点仍在使用的 `Agent::extend_system_prompt`、`remove_system_prompt_extra` 与独立宿主 extras。宿主同 key 注入不得被旧 session/operation 正文覆盖；同正文重写与不存在 key 的移除仍不推进内容 revision。
+- **薄 patch #7 的旧触发器退役**：上游经典循环现已逐次推理构造最新提示词，不再需要本地 `built_extras_revision` 和条件重建。保留「工具执行期间修改，下一次推理立即生效」与内容幂等判据；原来「第二次推理不得重建」的断言改判同正文不变，不绕开新的租约刷新。
+- **其他变化**：状态机前台子任务（#12632）、删除后台子任务/orchestrator（#12729）、工具收尾先于轮数限制（#12702）、OpenAI Responses 与模型元数据（#12568）、HTML 会话导出（#11977）、Windows npx 修复（#12176）。`#1`–`#6`、F-3 和主请求用途见证均保留。
+
+#### 消费方升级边界
+
+本次只同步 Goose fork，**不修改 `hasn-node` 的 git rev**。节点当前钉在 `bbb5e652761cf52f8ae2f595aac4ba207e0a46ca`，因此运行中的节点不会随 `hasn` 分支前移而升级。
+
+后续 rev bump 必须按新接口适配并验证：`ExtensionManager::add_client(config, client, info: Option<ServerConfig>)`（不再传独立 name）、`McpClientTrait` 的按会话异步 instructions/moim、`ExtensionManager::with_data_dir` 及新租约调用；不得把本次 fork 编译通过写成节点已完成升级。
+
+#### 本轮验证
+
+本轮 Cargo 使用该 worktree 独立外置 target；每条命令前按父仓 §9 重新取值并用 `hasn-node/scripts/verify-cargo-worktree-target.sh` 核验。构建 `CARGO_BUILD_JOBS=2`，测试 `RUST_MIN_STACK=8388608`、`CARGO_PROFILE_TEST_DEBUG=0`，测试线程为 1。
+
+| 验证 | 命令与实际结果 |
+|---|---|
+| 节点最小消费形态 | `cargo check -p goose -p goose-providers -p goose-provider-types --lib --no-default-features --locked`，rc=0 |
+| 薄补丁回归 | `cargo test -p goose --lib --no-default-features --features rustls-tls,code-mode,tree-sitter,live-voice,scheduler,platform-apps,chat-recall,acp-http --locked -- agents::prompt_manager::tests:: agents::extension_manager::tests:: agents::reply_parts::tests:: agents::state_machine::tests::context_files_lifecycle:: agents::state_machine::tests::system_prompt_extras_lifecycle:: agents::state_machine::tests::provider_errors_lifecycle:: session::session_manager::tests::create_session_with_id session::session_manager::tests::create_session_still_generates --test-threads=1`，100 通过，rc=0 |
+| 租约消费者回归 | 同一 Goose feature 集，过滤 `agents::moim::tests:: agents::platform_extensions::code_execution::tests:: agents::state_machine::ops_llm::tests:: agents::state_machine::tests::agent_reply:: agents::state_machine::tests::pipeline::`，实际选中 32 条、全部通过，rc=0；未命中的过滤项不算覆盖 |
+| Provider 与格式 | `cargo test -p goose-providers -p goose-provider-types --lib --no-default-features --features goose-providers/rustls-tls,goose-providers/live-websocket --locked -- --test-threads=1`，分别 266 与 630 通过，rc=0 |
+| 内核与直接消费者 Clippy | `cargo clippy -p goose -p goose-providers -p goose-provider-types -p goose-cli -p goose-sdk --all-targets --no-default-features --features goose/rustls-tls,goose/code-mode,goose/tree-sitter,goose/live-voice,goose/scheduler,goose/platform-apps,goose/chat-recall,goose/acp-http,goose-providers/live-websocket,goose-cli/rustls-tls,goose-cli/code-mode,goose-cli/tree-sitter,goose-cli/live-voice,goose-cli/scheduler,goose-cli/platform-apps,goose-cli/chat-recall,goose-cli/acp-http --locked -- -D warnings`，rc=0，有 `Checking goose`、`Checking goose-cli`、`Checking goose-sdk` 行 |
+| 格式与冲突 | 本次适配的 12 个 Rust 文件 `rustfmt +1.99.0 --edition 2021 --config skip_children=true --check` 与 `git diff --check`，rc=0；`git ls-files -u` 为空 |
+
+**失败与修复留痕**：宿主同 key 覆盖测试先红（rc=101，收到 `OPERATION_STALE` 而非 `HOST_CURRENT`），加宿主层最终覆盖后绿。回归首轮 84 通过、16 失败：10 条上游同步分类测试在无 Tokio 上下文初始化 SQLx 导致 LazyLock 被污染，改为 `#[tokio::test]`；本地 hints/extras 两组测试原默认走 Responses，改用上游同类测试的显式 `base_path("chat/completions")`。修正后 100 条全绿，未删断言。首次 Clippy 的失效 import 已删除并复验。
+
+未运行：完整 Goose/CLI/SDK 测试、产品 E2E（未获本轮授权）、完整跨仓 rev bump 验收、桌面 UI 验证。测试链接器曾提示 `__eh_frame` 超过 compact unwind 表大小，测试执行成功；未将此提示写成 lint 通过或故障掩盖。
+
 ## 消费方
 
 `hasn-node` 经 cargo git 依赖消费本仓，`rev` 钉死、**不跟分支**：

@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use anyhow::Result;
 use rmcp::model::ElicitationAction;
@@ -11,17 +11,20 @@ use super::calculator_extension::CalculatorExtension;
 use super::dummy_api::{DummyApi, ProviderFeatures};
 use crate::action_required_manager::ElicitationOutcome;
 use crate::agents::extension::ExtensionConfig;
-use crate::agents::extension_manager::{ExtensionManager, ExtensionManagerCapabilities};
+use crate::agents::extension_manager::{
+    ExtensionLease, ExtensionManager, ExtensionManagerCapabilities,
+};
 use crate::agents::mcp_client::McpClientTrait;
 use crate::agents::prompt_manager::PromptManager;
 use crate::agents::state_machine::{
     BangShellOperation, CompactionOperation, DoctorOperation, Emitter, EntryHookOperation,
-    ExitOnErrorOperation, GooseEffect, GooseInferenceProvider, GooseInferenceRequestPreparer,
-    InferenceRunner, MaxTurnsOperation, Operation, ProjectOperation, RecipeOperation,
-    RetryOperation, SkillOperation, SlashCommandOperation, StateMachine, StatusOperation,
-    SteerOperation, SteerQueue, Step, StopHookOperation, ToolApprovalOperation,
+    ExitOnErrorOperation, ForegroundSubagentOperation, GooseEffect, GooseInferenceProvider,
+    GooseInferenceRequestPreparer, InferenceRunner, MaxTurnsOperation, Operation, ProjectOperation,
+    RecipeOperation, RetryOperation, SkillOperation, SlashCommandOperation, StateMachine,
+    StatusOperation, SteerOperation, SteerQueue, Step, StopHookOperation, ToolApprovalOperation,
     ToolExecutionOperation, ToolPairCompactionOperation, UnknownToolOperation,
 };
+use crate::agents::subagent_handler::ForegroundSubagentRunner;
 use crate::agents::AgentEvent;
 use crate::config::permission::{PermissionLevel, PermissionManager};
 use crate::config::GooseMode;
@@ -33,7 +36,7 @@ use crate::permission::Permission;
 use crate::providers::base::Provider;
 use crate::security::security_inspector::SecurityInspector;
 use crate::session::extension_data::EnabledExtensionsState;
-use crate::session::{Session, SessionManager, SessionType};
+use crate::session::{GoalState, Session, SessionManager, SessionType};
 use crate::tool_inspection::ToolInspectionManager;
 use goose_providers::model::ModelConfig;
 
@@ -90,14 +93,13 @@ pub(super) struct TestPipeline {
     provider: Arc<dyn Provider>,
     model_config: ModelConfig,
     extension_manager: Arc<ExtensionManager>,
+    extension_lease: Arc<StdMutex<Option<Arc<ExtensionLease>>>>,
     goose_mode: TokioMutex<GooseMode>,
     prompt_manager: TokioMutex<PromptManager>,
     tool_inspection_manager: ToolInspectionManager,
     permission_manager: Arc<PermissionManager>,
     hook_manager: HookManager,
     stop_hook_block_cap: u32,
-    goal: TokioMutex<Option<String>>,
-    grind: TokioMutex<Option<String>>,
     calculator: Arc<CalculatorExtension>,
     pub(super) session_id: String,
     working_dir: std::path::PathBuf,
@@ -122,7 +124,6 @@ impl TestPipeline {
                 self.steer_queue.clone(),
                 self.hook_manager.clone(),
             )),
-            Arc::new(MaxTurnsOperation::new(self.max_turns)),
             Arc::new(BangShellOperation::new()),
         ];
         if !self.provider_features.manages_own_context {
@@ -133,6 +134,7 @@ impl TestPipeline {
                 COMPACTION_THRESHOLD,
             )));
         }
+        let extension_lease = Arc::clone(&self.extension_lease);
         let remaining_operations: Vec<Arc<dyn Operation<Session, GooseEffect> + '_>> = vec![
             Arc::new(ToolPairCompactionOperation::new(
                 provider.clone(),
@@ -144,9 +146,16 @@ impl TestPipeline {
                 &self.goose_mode,
                 &self.tool_inspection_manager,
             )),
-            Arc::new(DoctorOperation),
+            Arc::new(DoctorOperation::new(self.session_manager.clone())),
             Arc::new(ProjectOperation),
-            Arc::new(SkillOperation::new(self.hook_manager.clone())),
+            Arc::new(SkillOperation::new(
+                self.hook_manager.clone(),
+                Arc::clone(&extension_lease),
+            )),
+            Arc::new(ForegroundSubagentOperation::new(
+                ForegroundSubagentRunner::new(self.session_manager.clone(), false),
+                cancel.clone(),
+            )),
             Arc::new(RecipeOperation::new(
                 provider.clone(),
                 self.hook_manager.clone(),
@@ -155,11 +164,10 @@ impl TestPipeline {
                 &self.goose_mode,
                 self.extension_manager.clone(),
                 self.hook_manager.clone(),
+                Arc::clone(&extension_lease),
             )),
             Arc::new(UnknownToolOperation::new(self.hook_manager.clone())),
             Arc::new(RetryOperation::new(
-                &self.goal,
-                &self.grind,
                 std::time::Duration::from_secs(1),
                 std::time::Duration::from_secs(1),
             )),
@@ -168,11 +176,12 @@ impl TestPipeline {
                 self.stop_hook_block_cap,
             )),
             Arc::new(ExitOnErrorOperation),
+            Arc::new(MaxTurnsOperation::new(self.max_turns)),
         ];
         operations.extend(remaining_operations);
         let request_preparer = GooseInferenceRequestPreparer {
-            #[cfg(feature = "code-mode")]
-            extension_manager: self.extension_manager.clone(),
+            extension_manager: Arc::clone(&self.extension_manager),
+            extension_lease,
             goose_mode: &self.goose_mode,
             prompt_manager: &self.prompt_manager,
             tool_inspection_manager: &self.tool_inspection_manager,
@@ -305,11 +314,16 @@ impl TestPipeline {
     }
 
     pub(super) async fn get_goal(&self) -> Option<String> {
-        self.goal.lock().await.clone()
+        GoalState::of(&self.session().await.unwrap()).goal
     }
 
     pub(super) async fn set_grind(&self, grind: Option<String>) {
-        *self.grind.lock().await = grind;
+        let mut state = GoalState::of(&self.session().await.unwrap());
+        state.grind = grind;
+        self.session_manager
+            .set_extension_state(&self.session_id, &state)
+            .await
+            .unwrap();
     }
 
     pub(super) async fn session(&self) -> Result<Session> {
@@ -340,9 +354,7 @@ impl TestPipeline {
 
     pub(super) async fn reconstruct(&self) -> Result<Self> {
         let session = self.session().await?;
-        let goal = self.goal.lock().await.clone();
-        let grind = self.grind.lock().await.clone();
-        let pipeline = build_test_pipeline(
+        let mut pipeline = build_test_pipeline(
             self.session_manager.clone(),
             self.api.clone(),
             self.provider_features,
@@ -352,9 +364,9 @@ impl TestPipeline {
         )
         .await?
         .with_hook_manager(self.hook_manager.clone())
+        .with_max_turns(self.max_turns)
         .with_stop_hook_block_cap(self.stop_hook_block_cap);
-        *pipeline.goal.lock().await = goal;
-        *pipeline.grind.lock().await = grind;
+        pipeline.extension_lease = Arc::clone(&self.extension_lease);
         Ok(pipeline)
     }
 
@@ -398,6 +410,7 @@ impl TestPipeline {
         let mut events = Vec::new();
 
         for text in user_messages {
+            *self.extension_lease.lock().unwrap() = None;
             self.session_manager
                 .add_message(&self.session_id, &Message::user().with_text(text))
                 .await?;
@@ -409,6 +422,7 @@ impl TestPipeline {
     }
 
     pub(super) async fn run_message(&self, message: Message) -> Result<TestRun> {
+        *self.extension_lease.lock().unwrap() = None;
         self.session_manager
             .add_message(&self.session_id, &message)
             .await?;
@@ -420,6 +434,7 @@ impl TestPipeline {
         mut self,
         message: &str,
     ) -> Result<(Self, TestRun, usize)> {
+        *self.extension_lease.lock().unwrap() = None;
         self.session_manager
             .add_message(&self.session_id, &Message::user().with_text(message))
             .await?;
@@ -538,6 +553,7 @@ impl TestPipeline {
         message: &str,
         cancel: CancellationToken,
     ) -> Result<TestRun> {
+        *self.extension_lease.lock().unwrap() = None;
         self.session_manager
             .add_message(&self.session_id, &Message::user().with_text(message))
             .await?;
@@ -561,6 +577,7 @@ impl TestPipeline {
         action: ElicitationAction,
         user_data: serde_json::Value,
     ) -> Result<TestRun> {
+        *self.extension_lease.lock().unwrap() = None;
         self.session_manager
             .add_message(&self.session_id, &Message::user().with_text(message))
             .await?;
@@ -644,18 +661,13 @@ impl TestPipeline {
         Ok(TestRun::new(self.session().await?, events))
     }
 
-    pub(super) async fn set_system_prompt_override(&self, prompt: impl Into<String>) {
-        self.prompt_manager
-            .lock()
+    pub(super) async fn set_system_prompt_override(&self, prompt: Option<&str>) {
+        self.session_manager
+            .update(&self.session_id)
+            .system_prompt_override(prompt.map(str::to_string))
+            .apply()
             .await
-            .set_system_prompt_override(prompt.into());
-    }
-
-    pub(super) async fn clear_system_prompt_override(&self) {
-        self.prompt_manager
-            .lock()
-            .await
-            .clear_system_prompt_override();
+            .unwrap();
     }
 }
 
@@ -755,6 +767,7 @@ async fn build_test_pipeline(
     )?;
     let provider: Arc<dyn Provider> = Arc::new(
         goose_providers::openai::OpenAiProviderBuilder::new(api_client)
+            .base_path("chat/completions")
             .name(provider_name)
             .preserve_thinking_context(provider_features.preserves_thinking)
             .build(),
@@ -768,9 +781,10 @@ async fn build_test_pipeline(
         } else {
             provider
         };
-    let shared_provider = Arc::new(TokioMutex::new(Some(provider.clone())));
+    let providers: Arc<crate::agents::provider_manager::ProviderManager> = Default::default();
+    providers.set_provider(&session.id, provider.clone()).await;
     let extension_manager = Arc::new(ExtensionManager::new(
-        shared_provider.clone(),
+        providers.clone(),
         session_manager.clone(),
         scheduler
             .clone()
@@ -789,7 +803,7 @@ async fn build_test_pipeline(
     tool_inspection_manager.add_inspector(Box::new(SecurityInspector::enabled()));
     tool_inspection_manager.add_inspector(Box::new(PermissionInspector::new(
         permission_manager.clone(),
-        shared_provider,
+        providers,
         session_manager.clone(),
     )));
     let model_config = session
@@ -804,14 +818,13 @@ async fn build_test_pipeline(
         provider: provider.clone(),
         model_config,
         extension_manager,
+        extension_lease: Arc::new(StdMutex::new(None)),
         goose_mode: TokioMutex::new(session.goose_mode),
         prompt_manager: TokioMutex::new(PromptManager::new()),
         tool_inspection_manager,
         permission_manager,
         hook_manager: HookManager::default(),
         stop_hook_block_cap: 3,
-        goal: TokioMutex::new(None),
-        grind: TokioMutex::new(None),
         calculator: calculator.clone(),
         session_id: session.id.clone(),
         working_dir: session.working_dir.clone(),
@@ -849,7 +862,6 @@ async fn build_test_pipeline(
         if extension.name() == "calculator" {
             extension_manager
                 .add_client(
-                    "calculator".to_string(),
                     extension,
                     calculator.clone(),
                     calculator.get_info().cloned(),
