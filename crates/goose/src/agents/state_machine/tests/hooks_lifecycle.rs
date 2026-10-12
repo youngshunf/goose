@@ -9,6 +9,7 @@ use crate::agents::platform_extensions::MANAGE_EXTENSIONS_TOOL_NAME_COMPLETE;
 use crate::agents::state_machine::ops_stop_hook::DENIED;
 use crate::agents::state_machine::ops_unknown_tool::UNCLAIMED_TOOL_ERROR;
 use crate::agents::tool_execution::{CHAT_MODE_TOOL_SKIPPED_RESPONSE, DECLINED_RESPONSE};
+use crate::agents::FilesystemSkills;
 use crate::config::permission::PermissionLevel;
 use crate::config::GooseMode;
 use crate::conversation::message::{Message, MessageContent, SystemNotificationType};
@@ -891,7 +892,10 @@ async fn load_skill_emits_pre_tool_use_and_result_with_matching_id() -> Result<(
         ("PreToolUseResult", "", "result.sh", RECORD_RESULT_SCRIPT),
     ]);
     let (pipeline, api) = test_pipeline().await?;
-    let pipeline = pipeline.with_hook_manager(env.hook_manager());
+    // 唤星 PATCHES.md #9：文件系统技能发现默认关闭，本片测试显式开工作目录档。
+    let pipeline = pipeline
+        .with_hook_manager(env.hook_manager())
+        .with_filesystem_skills(FilesystemSkills::WorkingDirectory);
     let arguments = install_skill(pipeline.working_dir());
     api.on("use the skill").call("load_skill", arguments);
     api.on("SKILL_BODY_CONTENT").reply("skill loaded");
@@ -935,7 +939,10 @@ async fn load_skill_emits_post_tool_event() -> Result<()> {
         ),
     ]);
     let (pipeline, api) = test_pipeline().await?;
-    let pipeline = pipeline.with_hook_manager(env.hook_manager());
+    // 唤星 PATCHES.md #9：文件系统技能发现默认关闭，本片测试显式开工作目录档。
+    let pipeline = pipeline
+        .with_hook_manager(env.hook_manager())
+        .with_filesystem_skills(FilesystemSkills::WorkingDirectory);
     let arguments = install_skill(pipeline.working_dir());
     api.on("use the skill").call("load_skill", arguments);
     api.on("SKILL_BODY_CONTENT").reply("skill loaded");
@@ -976,7 +983,10 @@ async fn load_skill_denied_by_hook_does_not_execute() -> Result<()> {
         ),
     ]);
     let (pipeline, api) = test_pipeline().await?;
-    let pipeline = pipeline.with_hook_manager(env.hook_manager());
+    // 唤星 PATCHES.md #9：文件系统技能发现默认关闭，本片测试显式开工作目录档。
+    let pipeline = pipeline
+        .with_hook_manager(env.hook_manager())
+        .with_filesystem_skills(FilesystemSkills::WorkingDirectory);
     let arguments = install_skill(pipeline.working_dir());
     api.on("use the skill").call("load_skill", arguments);
     api.on("denied by policy hook").reply("understood");

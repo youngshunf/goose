@@ -99,6 +99,21 @@ impl fmt::Display for GoosePlatform {
     }
 }
 
+/// 文件系统技能发现档位（唤星 PATCHES.md #9）。管住状态机 `SkillOperation` 的三件事：
+/// 是否扫文件系统发现技能、是否向模型广告无前缀 `load_skill` 工具、是否把 `# Skills`
+/// 段注入系统提示词。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FilesystemSkills {
+    /// 默认：不扫文件系统、不广告 `load_skill`、不注入 `# Skills` 段；模型硬发
+    /// `load_skill` 落到执行面时具名失败而不是照常读文件。
+    #[default]
+    Disabled,
+    /// 只发现本轮会话工作目录下的技能（`<workdir>/.agents|.goose|.claude/skills`
+    /// 与项目级插件技能目录，即 `SourceEntry.global == false` 的来源），不含 home、
+    /// 全局配置目录与内置技能（它们 `global == true`，被同一过滤排除）。
+    WorkingDirectory,
+}
+
 #[derive(Clone)]
 pub struct AgentConfig {
     pub session_manager: Arc<SessionManager>,
@@ -116,6 +131,9 @@ pub struct AgentConfig {
     /// （原行为）；`Some(vec![])` ⇒ 一个 hints 文件都不读。见
     /// [`AgentConfig::with_context_file_names`]。
     pub context_file_names: Option<Vec<String>>,
+    /// 文件系统技能发现档位（唤星 PATCHES.md #9）。见
+    /// [`AgentConfig::with_filesystem_skills`]。
+    pub filesystem_skills: FilesystemSkills,
     /// 工具目录读取失败时是否必须向嵌入方传播错误。
     pub strict_tool_list: bool,
     pub providers: Arc<ProviderManager>,
@@ -142,6 +160,7 @@ impl AgentConfig {
             use_login_shell_path: None,
             is_subagent: false,
             context_file_names: None,
+            filesystem_skills: FilesystemSkills::Disabled,
             strict_tool_list: false,
             providers: Arc::default(),
         }
@@ -165,6 +184,23 @@ impl AgentConfig {
     /// 在嵌入模式下严格传播工具目录读取错误。
     pub fn with_strict_tool_list(mut self, strict_tool_list: bool) -> Self {
         self.strict_tool_list = strict_tool_list;
+        self
+    }
+
+    /// 设定文件系统技能发现档位（唤星 PATCHES.md #9），语义见 [`FilesystemSkills`]。
+    ///
+    /// 不调用本方法 ⇒ `Disabled`。与「薄 patch 缺省行为逐字节不变」的惯例不同，
+    /// 本 patch 的缺省相对上游是**有意的默认关闭**（主人 2026-10-13 裁决）：唤星侧已有
+    /// 自己的技能链，上游这条文件系统技能旁路只在编程开发场景需要「工作目录里发现的
+    /// 技能」时才开。
+    ///
+    /// ⚠️ 由 `summon` 派生的子 Agent 自建 `AgentConfig`，**不继承**本字段。
+    ///
+    /// 状态机的 operations 表每次 reply 都重建并在那时读取本字段
+    /// （`Agent::create_state_machine` ← `stream_state_machine_session`），因此嵌入方
+    /// 在两轮之间改写 `agent.config.filesystem_skills` 即可按轮翻档，不必重建 Agent。
+    pub fn with_filesystem_skills(mut self, filesystem_skills: FilesystemSkills) -> Self {
+        self.filesystem_skills = filesystem_skills;
         self
     }
 
@@ -669,10 +705,10 @@ impl Agent {
             Arc::new(ToolApprovalOperation::new(&self.tool_inspection_manager)),
             Arc::new(DoctorOperation::new(self.config.session_manager.clone())),
             Arc::new(ProjectOperation),
-            Arc::new(SkillOperation::new(
-                self.hook_manager.clone(),
-                Arc::clone(&extension_lease),
-            )),
+            Arc::new(
+                SkillOperation::new(self.hook_manager.clone(), Arc::clone(&extension_lease))
+                    .with_filesystem_skills(self.config.filesystem_skills),
+            ),
             // Before RecipeOperation: a `delegate` response only means the subagent
             // started, so a final output from the same batch must not be shown until
             // the subagents have run.

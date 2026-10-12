@@ -21,7 +21,9 @@ use crate::acp::server::GooseAcpAgent;
 use crate::agents::extension::ExtensionConfig;
 use crate::agents::mcp_client::McpClientTrait;
 use crate::agents::state_machine::ops_toolcalling::EXPIRED_APPROVAL_RESPONSE;
-use crate::agents::{Agent, AgentConfig, AgentEvent, GoosePlatform, SessionConfig};
+use crate::agents::{
+    Agent, AgentConfig, AgentEvent, FilesystemSkills, GoosePlatform, SessionConfig,
+};
 use crate::config::permission::PermissionManager;
 use crate::config::GooseMode;
 use crate::conversation::message::{ActionRequiredData, Message, MessageContent};
@@ -138,6 +140,80 @@ fn confirmation_ids(messages: &[Message]) -> Vec<String> {
             _ => None,
         })
         .collect()
+}
+
+/// 唤星 PATCHES.md #9：`AgentConfig` 默认 `FilesystemSkills::Disabled`——即使工作目录里
+/// 放了技能，状态机推理也不广告无前缀 `load_skill`，系统提示词也不注入 `# Skills` 段。
+#[tokio::test]
+async fn filesystem_skills_disabled_by_default_advertises_no_load_skill() -> Result<()> {
+    let (agent, api, session_id, working_dir) = agent_with_dummy_api().await?;
+    install_skill(working_dir.path(), "DISABLED_SKILL_BODY")?;
+    api.on("hello").reply("hi");
+
+    let session_config = SessionConfig {
+        id: session_id,
+        schedule_id: None,
+        max_turns: Some(1),
+    };
+    let mut stream = agent
+        .reply(Message::user().with_text("hello"), session_config, None)
+        .await?;
+    while let Some(event) = stream.next().await {
+        event?;
+    }
+
+    let calls = api.calls();
+    assert_eq!(calls.len(), 1);
+    assert!(
+        !calls[0].advertises_tool("load_skill"),
+        "默认档位（Disabled）不得广告 load_skill"
+    );
+    assert!(
+        !calls[0].system_contains("# Skills"),
+        "默认档位（Disabled）不得注入 # Skills 段"
+    );
+    Ok(())
+}
+
+/// 唤星 PATCHES.md #9：经 `AgentConfig` 开到 `WorkingDirectory` 后，同一个 Agent 的下一次
+/// reply 即广告 `load_skill` 并把工作目录技能注入 `# Skills` 段——档位在
+/// `create_state_machine` 每轮重建 operations 表时读取，按轮生效；本条同时证明
+/// `AgentConfig → create_state_machine → SkillOperation` 的接线没断。
+#[tokio::test]
+async fn filesystem_skills_working_directory_advertises_load_skill_and_workdir_skill() -> Result<()>
+{
+    let (mut agent, api, session_id, working_dir) = agent_with_dummy_api().await?;
+    agent.config.filesystem_skills = FilesystemSkills::WorkingDirectory;
+    install_skill(working_dir.path(), "WORKDIR_SKILL_BODY")?;
+    api.on("hello").reply("hi");
+
+    let session_config = SessionConfig {
+        id: session_id,
+        schedule_id: None,
+        max_turns: Some(1),
+    };
+    let mut stream = agent
+        .reply(Message::user().with_text("hello"), session_config, None)
+        .await?;
+    while let Some(event) = stream.next().await {
+        event?;
+    }
+
+    let calls = api.calls();
+    assert_eq!(calls.len(), 1);
+    assert!(
+        calls[0].advertises_tool("load_skill"),
+        "WorkingDirectory 档位必须广告 load_skill"
+    );
+    assert!(
+        calls[0].system_contains("# Skills"),
+        "WorkingDirectory 档位必须注入 # Skills 段"
+    );
+    assert!(
+        calls[0].system_contains("Review code"),
+        "工作目录技能（install_skill 的 description）必须出现在 # Skills 段"
+    );
+    Ok(())
 }
 
 async fn stream_messages(
@@ -448,7 +524,9 @@ async fn stop_at_a_confirmation_interrupts_the_waiting_call() -> Result<()> {
 
 #[tokio::test]
 async fn state_machine_skill_approval_uses_its_leased_working_dir() -> Result<()> {
-    let (agent, api, session_id, old_working_dir) = agent_with_dummy_api().await?;
+    let (mut agent, api, session_id, old_working_dir) = agent_with_dummy_api().await?;
+    // 唤星 PATCHES.md #9：文件系统技能发现默认关闭，本片测试显式开工作目录档。
+    agent.config.filesystem_skills = FilesystemSkills::WorkingDirectory;
     install_skill(old_working_dir.path(), "OLD_SKILL_CONTENT")?;
     agent
         .update_goose_mode(GooseMode::Approve, &session_id)
@@ -513,7 +591,9 @@ async fn state_machine_skill_approval_uses_its_leased_working_dir() -> Result<()
 
 #[tokio::test]
 async fn state_machine_rejects_resumed_skill_approval_without_its_lease() -> Result<()> {
-    let (agent, api, session_id, working_dir) = agent_with_dummy_api().await?;
+    let (mut agent, api, session_id, working_dir) = agent_with_dummy_api().await?;
+    // 唤星 PATCHES.md #9：文件系统技能发现默认关闭，本片测试显式开工作目录档。
+    agent.config.filesystem_skills = FilesystemSkills::WorkingDirectory;
     install_skill(working_dir.path(), "SKILL_MUST_NOT_LOAD")?;
     agent
         .update_goose_mode(GooseMode::Approve, &session_id)

@@ -7,6 +7,7 @@ use super::pipeline::{
 };
 #[cfg(feature = "code-mode")]
 use crate::agents::state_machine::ops_tool_approval::TOOL_EXECUTABLE_KEY;
+use crate::agents::FilesystemSkills;
 #[cfg(feature = "code-mode")]
 use crate::config::permission::PermissionLevel;
 #[cfg(feature = "code-mode")]
@@ -16,7 +17,9 @@ use crate::conversation::message::MessageContent;
 
 #[tokio::test]
 async fn prompt_and_skill_lifecycle() -> Result<()> {
+    // 唤星 PATCHES.md #9：文件系统技能发现默认关闭，本片测试显式开工作目录档。
     let (pipeline, api) = test_pipeline().await?;
+    let pipeline = pipeline.with_filesystem_skills(FilesystemSkills::WorkingDirectory);
     std::fs::write(
         pipeline.working_dir().join("AGENTS.md"),
         "ROOT_PROJECT_INSTRUCTION",

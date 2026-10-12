@@ -22,6 +22,7 @@ use crate::agents::state_machine::{
     GooseEffect, Operation, OperationResult, SlashCommand,
 };
 use crate::agents::tool_execution::{CHAT_MODE_TOOL_SKIPPED_RESPONSE, DECLINED_RESPONSE};
+use crate::agents::FilesystemSkills;
 use crate::config::GooseMode;
 use crate::conversation::message::Message;
 use crate::conversation::Conversation;
@@ -33,6 +34,8 @@ const LOAD_SKILL_TOOL_NAME: &str = "load_skill";
 pub struct SkillOperation {
     hook_manager: HookManager,
     extension_lease: Arc<StdMutex<Option<Arc<ExtensionLease>>>>,
+    /// 文件系统技能发现档位（唤星 PATCHES.md #9）。
+    filesystem_skills: FilesystemSkills,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -59,8 +62,21 @@ fn skill_tool() -> Result<Tool> {
     ))
 }
 
-fn skill_instructions(working_dir: &Path) -> Option<String> {
-    let sources = crate::skills::discover_skills(Some(working_dir));
+/// 按档位发现技能（唤星 PATCHES.md #9）：`Disabled` 一个都不扫；`WorkingDirectory` 只保留
+/// `SourceEntry.global == false` 的来源（工作目录与项目级插件技能目录）——home、全局配置
+/// 目录与内置技能（`global == true`）被同一过滤排除。
+fn discovered_skills(working_dir: &Path, filesystem_skills: FilesystemSkills) -> Vec<SourceEntry> {
+    match filesystem_skills {
+        FilesystemSkills::Disabled => Vec::new(),
+        FilesystemSkills::WorkingDirectory => crate::skills::discover_skills(Some(working_dir))
+            .into_iter()
+            .filter(|source| !source.global)
+            .collect(),
+    }
+}
+
+fn skill_instructions(working_dir: &Path, filesystem_skills: FilesystemSkills) -> Option<String> {
+    let sources = discovered_skills(working_dir, filesystem_skills);
     let mut skills: Vec<&SourceEntry> = sources
         .iter()
         .filter(|source| {
@@ -84,7 +100,19 @@ fn skill_instructions(working_dir: &Path) -> Option<String> {
     Some(instructions)
 }
 
-fn execute_skill(working_dir: &Path, arguments: Option<JsonObject>) -> CallToolResult {
+fn execute_skill(
+    working_dir: &Path,
+    filesystem_skills: FilesystemSkills,
+    arguments: Option<JsonObject>,
+) -> CallToolResult {
+    // 档位把守（唤星 PATCHES.md #9）：工具没被广告不代表调用到不了这里——无 inference
+    // 元数据的请求会绕过广告面核对（`request_was_advertised` 视其为已广告），必须具名
+    // 失败而不是照常读文件。
+    if filesystem_skills == FilesystemSkills::Disabled {
+        return CallToolResult::error(vec![ContentBlock::text(format!(
+            "Tool '{LOAD_SKILL_TOOL_NAME}' is disabled: filesystem skill discovery is off for this agent."
+        ))]);
+    }
     let params = arguments
         .map(Value::Object)
         .ok_or_else(|| "Missing arguments".to_string())
@@ -98,7 +126,7 @@ fn execute_skill(working_dir: &Path, arguments: Option<JsonObject>) -> CallToolR
     };
     let skill_name = params.name.as_str();
     let args = params.args.as_deref();
-    let skills = crate::skills::discover_skills(Some(working_dir));
+    let skills = discovered_skills(working_dir, filesystem_skills);
 
     if let Some(skill) = skills.iter().find(|skill| skill.name == skill_name) {
         return match crate::skills::loaded_skill_context_with_args(skill, args) {
@@ -202,7 +230,15 @@ impl SkillOperation {
         Self {
             hook_manager,
             extension_lease,
+            filesystem_skills: FilesystemSkills::default(),
         }
+    }
+
+    /// 设定文件系统技能发现档位（唤星 PATCHES.md #9），语义见
+    /// [`crate::agents::FilesystemSkills`]。`new` 的缺省是 `Disabled`。
+    pub fn with_filesystem_skills(mut self, filesystem_skills: FilesystemSkills) -> Self {
+        self.filesystem_skills = filesystem_skills;
+        self
     }
 
     fn leased_session(&self, session: &Session) -> Option<Session> {
@@ -304,6 +340,9 @@ impl Operation<Session, GooseEffect> for SkillOperation {
     }
 
     async fn inference_tools(&self, _session: &Session) -> Result<Vec<Tool>> {
+        if self.filesystem_skills == FilesystemSkills::Disabled {
+            return Ok(Vec::new());
+        }
         Ok(vec![skill_tool()?])
     }
 
@@ -312,10 +351,12 @@ impl Operation<Session, GooseEffect> for SkillOperation {
         session: &Session,
         _conversation: &Conversation,
     ) -> Result<Vec<(String, String)>> {
-        Ok(skill_instructions(&session.working_dir)
-            .map(|instructions| ("skills".to_string(), instructions))
-            .into_iter()
-            .collect())
+        Ok(
+            skill_instructions(&session.working_dir, self.filesystem_skills)
+                .map(|instructions| ("skills".to_string(), instructions))
+                .into_iter()
+                .collect(),
+        )
     }
 
     async fn run(
@@ -388,7 +429,11 @@ impl Operation<Session, GooseEffect> for SkillOperation {
                         Ok(()) => {
                             let result = {
                                 let _entered = span.enter();
-                                execute_skill(&session.working_dir, tool_call.arguments.clone())
+                                execute_skill(
+                                    &session.working_dir,
+                                    self.filesystem_skills,
+                                    tool_call.arguments.clone(),
+                                )
                             };
                             if result.is_error == Some(true) {
                                 span.record("error.type", "tool_error");
@@ -434,6 +479,95 @@ impl Operation<Session, GooseEffect> for SkillOperation {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    /// 唤星 PATCHES.md #9：`Disabled` 档位下 `load_skill` 落到执行面也具名失败，不读任何
+    /// 技能文件。工作目录里故意放一个同名技能——若把守失效，结果会是成功而非「没找到」。
+    #[test]
+    fn disabled_execute_fails_by_name_without_reading_files() {
+        let working_dir = tempfile::tempdir().unwrap();
+        let skill_dir = working_dir.path().join(".agents/skills/demo");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: demo\ndescription: DEMO_SKILL_DESC\n---\nDEMO_SKILL_BODY",
+        )
+        .unwrap();
+        let arguments = serde_json::json!({ "name": "demo" }).as_object().cloned();
+
+        let result = execute_skill(working_dir.path(), FilesystemSkills::Disabled, arguments);
+
+        assert_eq!(result.is_error, Some(true));
+        let text = result.content[0].as_text().expect("expected text");
+        assert!(
+            text.text.contains("load_skill") && text.text.contains("disabled"),
+            "Disabled 档位下执行面必须具名失败：{}",
+            text.text
+        );
+        assert!(!text.text.contains("DEMO_SKILL_BODY"));
+    }
+
+    /// 唤星 PATCHES.md #9：`WorkingDirectory` 档位下 `load_skill` 只认非全局来源——全局配置
+    /// 目录（`$GOOSE_PATH_ROOT/config/skills`）里的技能按名查找也落空（具名 not found）。
+    /// 用 `GOOSE_PATH_ROOT` 充当局全局探针，不碰真实 home。
+    #[test]
+    fn working_directory_execute_does_not_load_global_skills() {
+        let path_root = tempfile::tempdir().unwrap();
+        let global_skill_dir = path_root.path().join("config/skills/global-only");
+        std::fs::create_dir_all(&global_skill_dir).unwrap();
+        std::fs::write(
+            global_skill_dir.join("SKILL.md"),
+            "---\nname: global-only\ndescription: GLOBAL_ONLY_DESC\n---\nGLOBAL_ONLY_BODY",
+        )
+        .unwrap();
+        let working_dir = tempfile::tempdir().unwrap();
+        let _guard = env_lock::lock_env([
+            ("GOOSE_PATH_ROOT", path_root.path().to_str()),
+            ("PLUGINS", None),
+        ]);
+        let arguments = serde_json::json!({ "name": "global-only" })
+            .as_object()
+            .cloned();
+
+        let result = execute_skill(
+            working_dir.path(),
+            FilesystemSkills::WorkingDirectory,
+            arguments,
+        );
+
+        assert_eq!(result.is_error, Some(true));
+        let text = result.content[0].as_text().expect("expected text");
+        assert!(
+            text.text.contains("Skill 'global-only' not found"),
+            "WorkingDirectory 档位下全局技能必须按名找不到：{}",
+            text.text
+        );
+        assert!(!text.text.contains("GLOBAL_ONLY_BODY"));
+    }
+
+    /// 唤星 PATCHES.md #9：`WorkingDirectory` 档位下工作目录技能正文确实能读出来
+    /// （非真空对照：上面的把守测试若恒真，这条会抓住「全部判 not found」的过度过滤）。
+    #[test]
+    fn working_directory_execute_loads_workdir_skill() {
+        let working_dir = tempfile::tempdir().unwrap();
+        let skill_dir = working_dir.path().join(".agents/skills/demo");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: demo\ndescription: DEMO_SKILL_DESC\n---\nDEMO_SKILL_BODY",
+        )
+        .unwrap();
+        let arguments = serde_json::json!({ "name": "demo" }).as_object().cloned();
+
+        let result = execute_skill(
+            working_dir.path(),
+            FilesystemSkills::WorkingDirectory,
+            arguments,
+        );
+
+        assert_eq!(result.is_error, Some(false));
+        let text = result.content[0].as_text().expect("expected text");
+        assert!(text.text.contains("DEMO_SKILL_BODY"));
+    }
 
     #[test]
     fn supporting_file_loader_reads_nested_regular_file() {

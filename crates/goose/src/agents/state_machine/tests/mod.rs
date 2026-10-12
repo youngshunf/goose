@@ -14,6 +14,7 @@ mod cancellation;
 mod compaction_lifecycle;
 mod context_files_lifecycle;
 mod dummy_api;
+mod filesystem_skills_gate;
 mod hooks_lifecycle;
 mod pipeline;
 mod prompt_skill_lifecycle;

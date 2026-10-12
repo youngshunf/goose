@@ -24,7 +24,7 @@ use crate::agents::state_machine::{
     UnknownToolOperation,
 };
 use crate::agents::subagent_handler::ForegroundSubagentRunner;
-use crate::agents::AgentEvent;
+use crate::agents::{AgentEvent, FilesystemSkills};
 use crate::config::permission::{PermissionLevel, PermissionManager};
 use crate::config::GooseMode;
 use crate::conversation::message::{ActionRequiredData, Message, MessageContent};
@@ -103,6 +103,7 @@ pub(super) struct TestPipeline {
     steer_queue: SteerQueue,
     prompt_manager: tokio::sync::Mutex<crate::agents::PromptManager>,
     max_turns: u32,
+    filesystem_skills: FilesystemSkills,
     scheduler: Option<Arc<crate::scheduler::Scheduler>>,
     _temp_dir: Arc<tempfile::TempDir>,
 }
@@ -143,10 +144,10 @@ impl TestPipeline {
             Arc::new(ToolApprovalOperation::new(&self.tool_inspection_manager)),
             Arc::new(DoctorOperation::new(self.session_manager.clone())),
             Arc::new(ProjectOperation),
-            Arc::new(SkillOperation::new(
-                self.hook_manager.clone(),
-                Arc::clone(&extension_lease),
-            )),
+            Arc::new(
+                SkillOperation::new(self.hook_manager.clone(), Arc::clone(&extension_lease))
+                    .with_filesystem_skills(self.filesystem_skills),
+            ),
             Arc::new(ForegroundSubagentOperation::new(
                 ForegroundSubagentRunner::new(self.session_manager.clone(), false),
                 cancel.clone(),
@@ -266,6 +267,12 @@ impl TestPipeline {
         self
     }
 
+    /// 设定文件系统技能发现档位（唤星 PATCHES.md #9）；缺省与生产一致，是 `Disabled`。
+    pub(super) fn with_filesystem_skills(mut self, filesystem_skills: FilesystemSkills) -> Self {
+        self.filesystem_skills = filesystem_skills;
+        self
+    }
+
     pub(super) async fn set_total_tokens(&self, tokens: i32) {
         use goose_providers::conversation::token_usage::Usage;
         self.session_manager
@@ -359,7 +366,8 @@ impl TestPipeline {
         .await?
         .with_hook_manager(self.hook_manager.clone())
         .with_max_turns(self.max_turns)
-        .with_stop_hook_block_cap(self.stop_hook_block_cap);
+        .with_stop_hook_block_cap(self.stop_hook_block_cap)
+        .with_filesystem_skills(self.filesystem_skills);
         pipeline.extension_lease = Arc::clone(&self.extension_lease);
         Ok(pipeline)
     }
@@ -846,6 +854,7 @@ async fn build_test_pipeline(
         steer_queue: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
         prompt_manager: tokio::sync::Mutex::new(crate::agents::PromptManager::new()),
         max_turns: MAX_TURNS,
+        filesystem_skills: FilesystemSkills::default(),
         scheduler,
         _temp_dir: temp_dir,
     };
