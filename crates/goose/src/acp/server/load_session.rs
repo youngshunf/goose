@@ -275,7 +275,6 @@ impl GooseAcpAgent {
             id: session_id.to_string(),
             schedule_id: None,
             max_turns: None,
-            retry_config: None,
         };
         let stream = match agent
             .resume_state_machine_turn(session_config, cancel_token.clone())
@@ -426,11 +425,6 @@ impl GooseAcpAgent {
             .await
             .internal_err_ctx("Failed to reload session")?;
 
-        agent
-            .update_extension_working_dir(&session.id, &session.working_dir)
-            .await
-            .internal_err_ctx("Failed to update extension working directory")?;
-
         let (mode_state, config_options) = build_session_setup_config(
             &self.provider_inventory,
             &session,
@@ -457,12 +451,11 @@ impl GooseAcpAgent {
             .as_ref()
             .map(pending_tool_confirmations)
             .unwrap_or_default();
-        let should_resume_state_machine = crate::agents::state_machine::enabled()
-            && (!pending_confirmations.is_empty()
-                || session
-                    .conversation
-                    .as_ref()
-                    .is_some_and(has_unapplied_tool_confirmation_response));
+        let should_resume_state_machine = !pending_confirmations.is_empty()
+            || session
+                .conversation
+                .as_ref()
+                .is_some_and(has_unapplied_tool_confirmation_response);
         if should_resume_state_machine {
             self.start_resumed_state_machine_turn(
                 cx,

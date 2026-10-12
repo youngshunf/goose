@@ -18,7 +18,8 @@ use tokio::sync::Mutex;
 pub struct GooseInferenceRequestPreparer<'a> {
     pub(crate) extension_manager: Arc<ExtensionManager>,
     pub(crate) extension_lease: Arc<StdMutex<Option<Arc<ExtensionLease>>>>,
-    pub(crate) goose_mode: &'a Mutex<GooseMode>,
+    /// Agent 持有的提示词管理器（唤星 `PATCHES.md` `#2`/`#7`）：宿主 extras 与嵌入方指定的
+    /// 上下文文件名都经它进系统提示词；每次推理前重建，同轮修改即生效。
     pub(crate) prompt_manager: &'a Mutex<PromptManager>,
     pub(crate) tool_inspection_manager: &'a ToolInspectionManager,
     pub(crate) context_limit: usize,
@@ -30,7 +31,7 @@ impl InferenceRequestPreparer<Session> for GooseInferenceRequestPreparer<'_> {
         let (session, lease) = self
             .extension_manager
             .current_session_snapshot(session)
-            .await;
+            .await?;
         // Tool requests run under the lease of the inference that made them, so an
         // approval answered after that lease is gone expires instead of picking up a new one.
         let awaiting = match &session.conversation {
@@ -64,7 +65,7 @@ impl InferenceRequestPreparer<Session> for GooseInferenceRequestPreparer<'_> {
         #[cfg(not(feature = "code-mode"))]
         let code_execution_mode = false;
 
-        let goose_mode = *self.goose_mode.lock().await;
+        let goose_mode = session.goose_mode;
         if goose_mode == GooseMode::SmartApprove {
             self.tool_inspection_manager
                 .apply_tool_annotations(&input.tools);

@@ -398,11 +398,7 @@ fn create_tool_callback(
                     .await;
                 match dispatch_result {
                     Ok(dispatch_result) => match manager
-                        .applying_mutation(
-                            dispatch_result,
-                            ctx.container().cloned(),
-                            &ctx.session_id,
-                        )
+                        .applying_mutation(dispatch_result, &ctx.session_id)
                         .result
                         .await
                     {
@@ -809,6 +805,7 @@ mod tests {
         let manager = Arc::new(ExtensionManager::with_data_dir(temp.path().join("manager")));
         manager
             .add_client(
+                "test-session",
                 ExtensionConfig::Builtin {
                     name: "visibility".to_string(),
                     description: "Visibility test tools".to_string(),
@@ -822,7 +819,7 @@ mod tests {
             )
             .await;
 
-        let lease = manager.current_lease("test-session", None).await;
+        let lease = manager.scope_lease("test-session").await;
         let configs = CodeExecutionClient::callback_configs(
             lease.tools_excluding(EXTENSION_NAME).await.unwrap(),
         );
@@ -853,7 +850,8 @@ mod tests {
             .await
             .unwrap();
         manager
-            .add_extension(
+            .enable(
+                &session.id,
                 ExtensionConfig::Platform {
                     name: super::super::summon::EXTENSION_NAME.to_string(),
                     description: String::new(),
@@ -861,14 +859,11 @@ mod tests {
                     bundled: None,
                     available_tools: Vec::new(),
                 },
-                Some(session.working_dir.clone()),
-                None,
-                Some(&session.id),
             )
             .await
             .unwrap();
 
-        let lease = manager.current_lease(&session.id, None).await;
+        let lease = manager.current_lease(&session.id).await.unwrap();
         let configs = CodeExecutionClient::callback_configs(
             lease.tools_excluding(EXTENSION_NAME).await.unwrap(),
         );
@@ -897,7 +892,8 @@ mod tests {
             .await
             .unwrap();
         manager
-            .add_extension(
+            .enable(
+                &session.id,
                 ExtensionConfig::Platform {
                     name: "extensionmanager".to_string(),
                     description: String::new(),
@@ -905,18 +901,14 @@ mod tests {
                     bundled: None,
                     available_tools: Vec::new(),
                 },
-                Some(session.working_dir.clone()),
-                None,
-                Some(&session.id),
             )
             .await
             .unwrap();
-        let lease = Arc::new(
-            manager
-                .current_lease(&session.id, Some(&session.working_dir))
-                .await,
-        );
-        manager.remove_extension("extensionmanager").await.unwrap();
+        let lease = Arc::new(manager.current_lease(&session.id).await.unwrap());
+        manager
+            .disable(&session.id, "extensionmanager")
+            .await
+            .unwrap();
         let callback = create_tool_callback(
             ToolCallContext::new(
                 session.id.clone(),
@@ -938,7 +930,7 @@ mod tests {
         .unwrap();
 
         assert!(manager
-            .list_extensions()
+            .list_extensions(&session.id)
             .await
             .unwrap()
             .contains(&"analyze".to_string()));

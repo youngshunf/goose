@@ -286,12 +286,11 @@ impl PromptManager {
     }
 
     pub fn build_system_prompt(
-        &mut self,
+        &self,
         session: &Session,
         prompt_parts: Vec<(String, String)>,
         goose_mode: GooseMode,
     ) -> String {
-        self.load_subdirectory_hints(&session.working_dir);
         self.builder()
             .with_session(session)
             .with_prompt_extras(prompt_parts)
@@ -387,7 +386,7 @@ mod tests {
 
     #[test]
     fn composed_prompt_uses_contributions_instead_of_the_extension_catalog() {
-        let mut manager = PromptManager::new();
+        let manager = PromptManager::new();
         let working_dir = tempfile::tempdir().unwrap();
 
         let session = Session {

@@ -1,5 +1,5 @@
 //! 嵌入方显式指定上下文文件名（`AgentConfig::with_context_file_names`，唤星 `PATCHES.md` `#2`）
-//! 经 `Agent::reply` **两条循环**（经典 / 状态机）的端到端判据。
+//! 经 `Agent::reply`（上游已删除经典循环，状态机是唯一路径）的端到端判据。
 //!
 //! 判定面是 **provider 真收到的 system prompt**（`DummyApi` 记下的请求体），
 //! ⛔ 不是 `PromptManager` 里的某个字段——字段对了而请求体里还有 hints，正是要抓的那种错。
@@ -76,7 +76,6 @@ fn lay_out_hint_files(base: &Path) -> PathBuf {
 /// 出现了哪些标记。
 async fn hint_markers_per_inference(
     context_file_names: Option<Vec<String>>,
-    use_state_machine: bool,
 ) -> Result<Vec<Vec<&'static str>>> {
     let api = Arc::new(DummyApi::start(ProviderFeatures::default()).await);
     let api_client = goose_providers::api_client::ApiClient::new_with_tls(
@@ -107,7 +106,6 @@ async fn hint_markers_per_inference(
         session_manager,
         Arc::new(PermissionManager::new(state_dir.join("permissions"))),
         None,
-        GooseMode::Auto,
         true,
         GoosePlatform::GooseCli,
     );
@@ -129,6 +127,7 @@ async fn hint_markers_per_inference(
     agent
         .extension_manager
         .add_client(
+            &session.id,
             ExtensionConfig::Platform {
                 name: "calculator".to_string(),
                 description: "Stateful test calculator".to_string(),
@@ -141,7 +140,7 @@ async fn hint_markers_per_inference(
         )
         .await;
 
-    // `path` 指向 `nested/` 下的文件 ⇒ 两条循环各自的子目录跟踪器都会把 `nested/` 记为待加载。
+    // `path` 指向 `nested/` 下的文件 ⇒ 状态机的子目录跟踪器会把 `nested/` 记为待加载。
     api.on("work in nested")
         .call(ADD, json!({ "value": 1, "path": "nested/file.rs" }));
     api.on("result: 1").reply("nested work complete");
@@ -150,13 +149,11 @@ async fn hint_markers_per_inference(
         id: session.id.clone(),
         schedule_id: None,
         max_turns: Some(4),
-        retry_config: None,
     };
     let mut stream = agent
         .reply(
             Message::user().with_text("work in nested"),
             session_config,
-            use_state_machine,
             Some(CancellationToken::new()),
         )
         .await?;
@@ -183,19 +180,16 @@ async fn hint_markers_per_inference(
         .collect())
 }
 
-/// ⭐ 显式空表 ⇒ 两条循环的每一次 system prompt 里**一个 hints 片段都没有**。
+/// ⭐ 显式空表 ⇒ 每一次 system prompt 里**一个 hints 片段都没有**。
 #[tokio::test]
 async fn explicit_empty_context_file_names_keep_every_hint_out_of_the_system_prompt() -> Result<()>
 {
-    for use_state_machine in [false, true] {
-        let seen = hint_markers_per_inference(Some(Vec::new()), use_state_machine).await?;
-        for (index, found) in seen.iter().enumerate() {
-            assert!(
-                found.is_empty(),
-                "state_machine={use_state_machine} 第 {index} 次推理：嵌入方给的是空表，\
-                 hints 文件却进了 system prompt：{found:?}"
-            );
-        }
+    let seen = hint_markers_per_inference(Some(Vec::new())).await?;
+    for (index, found) in seen.iter().enumerate() {
+        assert!(
+            found.is_empty(),
+            "第 {index} 次推理：嵌入方给的是空表，hints 文件却进了 system prompt：{found:?}"
+        );
     }
     Ok(())
 }
@@ -204,24 +198,19 @@ async fn explicit_empty_context_file_names_keep_every_hint_out_of_the_system_pro
 /// 工具调用之后子目录那份也进来。少了这一条，上一条在「内核根本不读 hints」的实现上也会绿。
 #[tokio::test]
 async fn unset_context_file_names_keep_the_default_hint_loading() -> Result<()> {
-    for use_state_machine in [false, true] {
-        let seen = hint_markers_per_inference(None, use_state_machine).await?;
-        let first = &seen[0];
-        for marker in WORKING_DIR_MARKERS {
-            assert!(
-                first.contains(&marker),
-                "state_machine={use_state_machine}：缺省行为丢了 {marker}：{first:?}"
-            );
-        }
-        assert!(
-            !first.contains(&NESTED_MARKER),
-            "state_machine={use_state_machine}：子目录 hints 只该在工具调用之后加载"
-        );
-        assert!(
-            seen[1].contains(&NESTED_MARKER),
-            "state_machine={use_state_machine}：工具调用之后子目录 hints 没有加载：{:?}",
-            seen[1]
-        );
+    let seen = hint_markers_per_inference(None).await?;
+    let first = &seen[0];
+    for marker in WORKING_DIR_MARKERS {
+        assert!(first.contains(&marker), "缺省行为丢了 {marker}：{first:?}");
     }
+    assert!(
+        !first.contains(&NESTED_MARKER),
+        "子目录 hints 只该在工具调用之后加载"
+    );
+    assert!(
+        seen[1].contains(&NESTED_MARKER),
+        "工具调用之后子目录 hints 没有加载：{:?}",
+        seen[1]
+    );
     Ok(())
 }

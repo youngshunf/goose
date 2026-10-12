@@ -28,7 +28,7 @@ use crate::conversation::message::{
     ToolConfirmationRequest, ToolRequest, ToolResponse,
 };
 use crate::conversation::Conversation;
-use crate::execution::manager::{AgentManager, AgentManagerGetResult, RuntimeContext};
+use crate::execution::manager::{AgentManager, RuntimeContext};
 use crate::permission::permission_confirmation::PrincipalType;
 use crate::permission::{Permission, PermissionConfirmation};
 use crate::providers::base::Provider;
@@ -411,13 +411,6 @@ fn extract_timeout_from_meta(meta: &Option<Meta>) -> Option<u64> {
         .and_then(|v| v.as_u64())
 }
 
-fn use_state_machine_from_meta(meta: Option<&Meta>) -> bool {
-    meta.and_then(|meta| meta.get("goose"))
-        .and_then(|goose| goose.get("unrolledAgentLoop"))
-        .and_then(|value| value.as_bool())
-        .unwrap_or_else(crate::agents::state_machine::enabled)
-}
-
 #[derive(Debug, Default, Deserialize)]
 struct ClientCapabilitiesMeta {
     #[serde(default)]
@@ -523,13 +516,21 @@ fn mcp_server_to_extension_config(mcp_server: McpServer) -> Result<ExtensionConf
     }
 }
 
+fn mcp_server_configs(
+    mcp_servers: Vec<McpServer>,
+) -> Result<Vec<ExtensionConfig>, agent_client_protocol::Error> {
+    mcp_servers
+        .into_iter()
+        .map(mcp_server_to_extension_config)
+        .collect::<Result<_, _>>()
+        .map_err(|message| agent_client_protocol::Error::invalid_params().data(message))
+}
+
 fn add_mcp_servers(
     extensions: &mut Vec<ExtensionConfig>,
     mcp_servers: Vec<McpServer>,
 ) -> Result<(), agent_client_protocol::Error> {
-    for mcp_server in mcp_servers {
-        let extension = mcp_server_to_extension_config(mcp_server)
-            .map_err(|message| agent_client_protocol::Error::invalid_params().data(message))?;
+    for extension in mcp_server_configs(mcp_servers)? {
         push_or_replace_extension(extensions, extension);
     }
     Ok(())
@@ -958,7 +959,6 @@ impl GooseAcpAgent {
             Arc::clone(&session_manager),
             Arc::clone(&permission_manager),
             options.scheduler,
-            Config::global().get_goose_mode().unwrap_or_default(),
             options.disable_session_naming,
             options.goose_platform.clone(),
         );
@@ -1045,11 +1045,11 @@ impl GooseAcpAgent {
         });
     }
 
-    async fn get_or_create_session_agent_with_results(
+    async fn get_or_create_session_agent(
         &self,
         cx: &ConnectionTo<Client>,
         session_id: String,
-    ) -> Result<AgentManagerGetResult, agent_client_protocol::Error> {
+    ) -> Result<Arc<Agent>, agent_client_protocol::Error> {
         self.agent_manager
             .get_or_create_agent_with_runtime_context(
                 session_id,
@@ -1069,7 +1069,7 @@ impl GooseAcpAgent {
         cx: &ConnectionTo<Client>,
         agent: &Arc<Agent>,
         session: &Session,
-    ) {
+    ) -> Result<(), agent_client_protocol::Error> {
         let client_fs_capabilities = self
             .client_fs_capabilities
             .get()
@@ -1080,15 +1080,16 @@ impl GooseAcpAgent {
             && !client_fs_capabilities.write_text_file
             && !client_terminal
         {
-            return;
+            return Ok(());
         }
 
         if !agent
             .extension_manager
-            .is_extension_enabled("developer")
+            .is_extension_enabled(&session.id, "developer")
             .await
+            .internal_err()?
         {
-            return;
+            return Ok(());
         }
 
         let context = agent.extension_manager.get_context().clone();
@@ -1096,7 +1097,7 @@ impl GooseAcpAgent {
             Ok(dev_client) => dev_client,
             Err(error) => {
                 warn!(error = %error, "Failed to create ACP developer client");
-                return;
+                return Ok(());
             }
         };
 
@@ -1114,16 +1115,18 @@ impl GooseAcpAgent {
 
         let developer_config = agent
             .extension_manager
-            .get_extension_configs()
+            .get_extension_configs(&session.id)
             .await
+            .internal_err()?
             .into_iter()
             .find(|extension| extension.name() == "developer")
             .unwrap_or_else(|| builtin_to_extension_config("developer"));
 
         agent
             .extension_manager
-            .add_client(developer_config, client, info)
+            .add_client(&session.id, developer_config, client, info)
             .await;
+        Ok(())
     }
 
     async fn prepare_acp_session_agent(
@@ -1131,15 +1134,23 @@ impl GooseAcpAgent {
         cx: &ConnectionTo<Client>,
         session: &Session,
     ) -> Result<(Arc<Agent>, Vec<ExtensionLoadResult>), agent_client_protocol::Error> {
-        let agent_result = self
-            .get_or_create_session_agent_with_results(cx, session.id.clone())
+        let agent = self
+            .get_or_create_session_agent(cx, session.id.clone())
             .await?;
-        let agent = agent_result.agent.clone();
         self.apply_acp_extension_overrides(cx, &agent, session)
+            .await?;
+        // Leases start extensions on first use anyway; starting them here is
+        // what lets the session response report extensions that fail.
+        let extension_results = agent
+            .extension_manager
+            .current_lease(&session.id)
+            .await
+            .internal_err()?
+            .start()
             .await;
         self.spawn_provider_inventory_refresh(session, &agent);
 
-        Ok((agent, agent_result.extension_results))
+        Ok((agent, extension_results))
     }
 
     async fn prepare_session_for_activation(
@@ -1168,14 +1179,15 @@ impl GooseAcpAgent {
         }
 
         if !mcp_servers.is_empty() {
-            let mut stored_extensions =
-                EnabledExtensionsState::from_extension_data(&session.extension_data)
-                    .unwrap_or_else(|| EnabledExtensionsState::new(Vec::new()));
-            add_mcp_servers(&mut stored_extensions.extensions, mcp_servers)?;
-            builder = builder.extension_data(enabled_extensions_data(
-                &session,
-                stored_extensions.extensions,
-            )?);
+            let extensions = mcp_server_configs(mcp_servers)?;
+            self.session_manager
+                .update_enabled_extensions(&session.id, |selected| {
+                    for extension in extensions {
+                        push_or_replace_extension(selected, extension);
+                    }
+                })
+                .await
+                .internal_err_ctx("Failed to add the client's MCP servers")?;
             session_needs_update = true;
         }
 
@@ -2112,7 +2124,6 @@ impl GooseAcpAgent {
         cancel_token: &CancellationToken,
         mut stream: BoxStream<'_, Result<crate::agents::AgentEvent>>,
     ) -> Result<AgentStreamOutcome, agent_client_protocol::Error> {
-        let mut was_cancelled = false;
         let mut output_token_limit_reached = false;
         let mut tool_requests = HashMap::new();
         let mut chain_tracker = ToolChainTracker::default();
@@ -2125,8 +2136,7 @@ impl GooseAcpAgent {
 
         while let Some(event) = stream.next().await {
             if cancel_token.is_cancelled() {
-                was_cancelled = true;
-                break;
+                continue;
             }
 
             match event {
@@ -2222,12 +2232,7 @@ impl GooseAcpAgent {
             }
         }
 
-        if cancel_token.is_cancelled() {
-            was_cancelled = true;
-            drop(stream);
-            agent.cancel_foreground_subagents(session_id).await;
-        }
-
+        let was_cancelled = cancel_token.is_cancelled();
         if !was_cancelled {
             if let Some(chain) = chain_tracker.close_current_chain() {
                 self.spawn_ready_chain_summary(chain, agent, acp_session_id, cx);
@@ -2302,23 +2307,20 @@ impl GooseAcpAgent {
         }
 
         let user_message = Self::convert_acp_prompt_to_message(&args.prompt);
-        let use_state_machine = use_state_machine_from_meta(args.meta.as_ref());
+        // The client's trace context must stay attached while the turn's spans and tool calls are polled.
+        #[cfg(feature = "otel")]
+        let trace_cx = crate::otel::trace_context::extract_from_meta(args.meta.as_ref())
+            .unwrap_or_else(opentelemetry::Context::current);
         let session_config = SessionConfig {
             id: session_id.clone(),
             schedule_id: None,
             max_turns: None,
-            retry_config: None,
         };
 
-        let stream = match agent
-            .reply(
-                user_message,
-                session_config,
-                use_state_machine,
-                Some(cancel_token.clone()),
-            )
-            .await
-        {
+        let reply = agent.reply(user_message, session_config, Some(cancel_token.clone()));
+        #[cfg(feature = "otel")]
+        let reply = opentelemetry::context::FutureExt::with_context(reply, trace_cx.clone());
+        let stream = match reply.await {
             Ok(stream) => stream,
             Err(error) => {
                 self.clear_active_run(&session_id, &run_id).await;
@@ -2327,16 +2329,17 @@ impl GooseAcpAgent {
                     .data(format!("Error getting agent reply: {error}")));
             }
         };
-        let stream_result = self
-            .forward_agent_stream(
-                cx,
-                &args.session_id,
-                &session_id,
-                &agent,
-                &cancel_token,
-                stream,
-            )
-            .await;
+        let forward = self.forward_agent_stream(
+            cx,
+            &args.session_id,
+            &session_id,
+            &agent,
+            &cancel_token,
+            stream,
+        );
+        #[cfg(feature = "otel")]
+        let forward = opentelemetry::context::FutureExt::with_context(forward, trace_cx);
+        let stream_result = forward.await;
         self.clear_active_run(&session_id, &run_id).await;
         Self::send_active_run_update(cx, &args.session_id, None)?;
         let outcome = stream_result?;
@@ -2467,7 +2470,10 @@ impl GooseAcpAgent {
             .await
             .internal_err_ctx("Failed to resolve model config")?;
         let current_model = current_model_config.model_name.clone();
-        let goose_mode = agent.goose_mode().await;
+        let goose_mode = agent
+            .goose_mode(&session_id.0)
+            .await
+            .internal_err_ctx("Failed to read goose mode")?;
         let inventory = self
             .provider_inventory
             .entry_for_provider(&provider_name)
@@ -3799,7 +3805,6 @@ print(\"hello, world\")
             server.session_manager.clone(),
             server.permission_manager.clone(),
             None,
-            GooseMode::Auto,
             true,
             GoosePlatform::GooseCli,
         )));

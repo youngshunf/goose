@@ -1,5 +1,5 @@
 //! provider 终态错误一律以带 kind 的 `Error` 块产出（唤星 `PATCHES.md` `#3`），
-//! 经 `Agent::reply` **两条循环**（经典 / 状态机）的端到端判据。
+//! 经 `Agent::reply` 的端到端判据（上游已删除经典循环，状态机是唯一路径）。
 //!
 //! 判定面是 `Agent::reply` 发出的 `AgentEvent` 流与落库的会话，⛔ 不是内部函数返回值。
 //! 单元夹具向 `Provider::stream` 注入确定错误，不冒称真实 relay E2E；
@@ -70,13 +70,13 @@ struct Outcome {
     persisted: Vec<Message>,
 }
 
-async fn reply_against(error: ProviderError, use_state_machine: bool) -> Result<Outcome> {
+async fn reply_against(error: ProviderError) -> Result<Outcome> {
     let calls = Arc::new(AtomicUsize::new(0));
     let provider = Arc::new(FailingProvider {
         error,
         calls: calls.clone(),
     });
-    let (emitted, persisted) = reply_with_provider(provider, use_state_machine).await?;
+    let (emitted, persisted) = reply_with_provider(provider).await?;
     Ok(Outcome {
         provider_calls: calls.load(Ordering::SeqCst),
         emitted,
@@ -86,7 +86,6 @@ async fn reply_against(error: ProviderError, use_state_machine: bool) -> Result<
 
 async fn reply_with_provider(
     provider: Arc<dyn Provider>,
-    use_state_machine: bool,
 ) -> Result<(Vec<Message>, Vec<Message>)> {
     let temp_dir = tempfile::tempdir()?;
     let state_dir = temp_dir.path().join("state");
@@ -103,7 +102,6 @@ async fn reply_with_provider(
         session_manager.clone(),
         Arc::new(PermissionManager::new(state_dir.join("permissions"))),
         None,
-        GooseMode::Auto,
         true,
         GoosePlatform::GooseCli,
     ));
@@ -115,13 +113,11 @@ async fn reply_with_provider(
         id: session.id.clone(),
         schedule_id: None,
         max_turns: Some(4),
-        retry_config: None,
     };
     let mut stream = agent
         .reply(
             Message::user().with_text("hello"),
             session_config,
-            use_state_machine,
             Some(CancellationToken::new()),
         )
         .await?;
@@ -146,9 +142,8 @@ fn assert_terminal_error_block(
     error: ProviderError,
     expected_kind: MessageErrorKind,
     outcome: &Outcome,
-    use_state_machine: bool,
 ) {
-    let label = format!("state_machine={use_state_machine} {error:?}");
+    let label = format!("{error:?}");
     let expected_text = legacy_text(&error);
     assert!(
         outcome.provider_calls >= 1,
@@ -227,16 +222,13 @@ impl Provider for EmptyStreamingProvider {
     }
 }
 
-async fn reply_against_empty_stream(
-    max_retries: usize,
-    use_state_machine: bool,
-) -> Result<Outcome> {
+async fn reply_against_empty_stream(max_retries: usize) -> Result<Outcome> {
     let calls = Arc::new(AtomicUsize::new(0));
     let provider = Arc::new(EmptyStreamingProvider {
         calls: Arc::clone(&calls),
         max_retries,
     });
-    let (emitted, persisted) = reply_with_provider(provider, use_state_machine).await?;
+    let (emitted, persisted) = reply_with_provider(provider).await?;
     Ok(Outcome {
         provider_calls: calls.load(Ordering::SeqCst),
         emitted,
@@ -244,89 +236,10 @@ async fn reply_against_empty_stream(
     })
 }
 
-/// 零重试实例的空轮必须在第一次成功的空 stream 后报告具名失败，不再请求 provider。
-#[tokio::test]
-async fn zero_retry_provider_ends_empty_successful_turn_with_error_without_replay() -> Result<()> {
-    let outcome = reply_against_empty_stream(0, false).await?;
-    assert_eq!(outcome.provider_calls, 1, "零重试仍重放了非幂等的空轮请求");
-    let emitted_errors: Vec<_> = outcome
-        .emitted
-        .iter()
-        .flat_map(|message| {
-            message
-                .content
-                .iter()
-                .filter_map(|content| content.as_error())
-        })
-        .collect();
-    assert_eq!(
-        emitted_errors.len(),
-        1,
-        "事件流应恰有一个 Error 块：{:?}",
-        outcome.emitted
-    );
-    assert_eq!(emitted_errors[0].kind, MessageErrorKind::Other);
-    assert_eq!(
-        emitted_errors[0].message,
-        "The model returned an empty response. Please resend your message to continue."
-    );
-    assert_eq!(
-        outcome
-            .emitted
-            .iter()
-            .filter(|message| message.error_kind().is_some())
-            .count(),
-        1,
-        "事件流不能重复发出错误"
-    );
-    assert!(
-        outcome
-            .emitted
-            .iter()
-            .all(|message| message.role != Role::Assistant
-                || message
-                    .content
-                    .iter()
-                    .all(|content| content.as_text().is_none())),
-        "空轮不能再以普通 assistant 文本伪装成功：{:?}",
-        outcome.emitted
-    );
-    let error_message = outcome
-        .persisted
-        .iter()
-        .find(|message| message.error_kind() == Some(MessageErrorKind::Other))
-        .expect("会话必须持久化空轮 Error 块");
-    assert_eq!(
-        error_message.content.len(),
-        1,
-        "持久化消息应只包含 Error 块"
-    );
-    assert_eq!(error_message.content[0].as_error(), Some(emitted_errors[0]));
-    assert!(error_message.is_user_visible(), "主人必须看得见空轮错误");
-    assert!(
-        !error_message.is_agent_visible(),
-        "下一轮模型不应读到空轮错误"
-    );
-    Ok(())
-}
-
-/// 默认 provider 仍按既有固定 1+3 次空轮重试，不受零重试实例行为影响。
-#[tokio::test]
-async fn default_retry_provider_still_replays_empty_turn_four_times() -> Result<()> {
-    let outcome = reply_against_empty_stream(3, false).await?;
-    assert_eq!(outcome.provider_calls, 4);
-    assert!(outcome.emitted.iter().any(|message| {
-        message.role == Role::Assistant
-            && message.as_concat_text()
-                == "The model returned an empty response. Please resend your message to continue."
-    }));
-    Ok(())
-}
-
-/// 状态机空轮本就只调用一次 provider，经典循环的修补不得改变它。
+/// 状态机空轮只调用一次 provider（`#5` 的经典循环修补已随经典循环一起删除）。
 #[tokio::test]
 async fn state_machine_does_not_replay_zero_retry_empty_turn() -> Result<()> {
-    let outcome = reply_against_empty_stream(0, true).await?;
+    let outcome = reply_against_empty_stream(0).await?;
     assert_eq!(outcome.provider_calls, 1);
     assert!(outcome.emitted.iter().any(|message| {
         message.role == Role::Assistant
@@ -336,35 +249,21 @@ async fn state_machine_does_not_replay_zero_retry_empty_turn() -> Result<()> {
     Ok(())
 }
 
-/// ⭐ 网络错误（relay 断连、重试耗尽）⇒ 两条循环都产出 `Error { kind: Other }`。
+/// ⭐ 网络错误（relay 断连、重试耗尽）⇒ 产出 `Error { kind: Other }`。
 #[tokio::test]
 async fn network_error_ends_the_turn_with_an_error_block() -> Result<()> {
     let error = ProviderError::NetworkError("connection reset by relay".to_string());
-    for use_state_machine in [false, true] {
-        let outcome = reply_against(error.clone(), use_state_machine).await?;
-        assert_terminal_error_block(
-            error.clone(),
-            MessageErrorKind::Other,
-            &outcome,
-            use_state_machine,
-        );
-    }
+    let outcome = reply_against(error.clone()).await?;
+    assert_terminal_error_block(error.clone(), MessageErrorKind::Other, &outcome);
     Ok(())
 }
 
-/// ⭐ 通配那一支（`RequestFailed`：relay 404 之类）⇒ 两条循环都产出 `Error { kind: Other }`。
+/// ⭐ 通配那一支（`RequestFailed`：relay 404 之类）⇒ 产出 `Error { kind: Other }`。
 #[tokio::test]
 async fn other_provider_error_ends_the_turn_with_an_error_block() -> Result<()> {
     let error = ProviderError::RequestFailed("relay route not found".to_string());
-    for use_state_machine in [false, true] {
-        let outcome = reply_against(error.clone(), use_state_machine).await?;
-        assert_terminal_error_block(
-            error.clone(),
-            MessageErrorKind::Other,
-            &outcome,
-            use_state_machine,
-        );
-    }
+    let outcome = reply_against(error.clone()).await?;
+    assert_terminal_error_block(error.clone(), MessageErrorKind::Other, &outcome);
     Ok(())
 }
 
@@ -373,14 +272,7 @@ async fn other_provider_error_ends_the_turn_with_an_error_block() -> Result<()> 
 #[tokio::test]
 async fn authentication_error_ends_the_turn_with_an_error_block() -> Result<()> {
     let error = ProviderError::Authentication("invalid relay token".to_string());
-    for use_state_machine in [false, true] {
-        let outcome = reply_against(error.clone(), use_state_machine).await?;
-        assert_terminal_error_block(
-            error.clone(),
-            MessageErrorKind::Authentication,
-            &outcome,
-            use_state_machine,
-        );
-    }
+    let outcome = reply_against(error.clone()).await?;
+    assert_terminal_error_block(error.clone(), MessageErrorKind::Authentication, &outcome);
     Ok(())
 }

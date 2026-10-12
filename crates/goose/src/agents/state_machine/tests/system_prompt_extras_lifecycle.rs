@@ -127,10 +127,7 @@ impl McpClientTrait for ExpertSwitchExtension {
 }
 
 /// 跑一轮「先调 `select`、再收尾」，交回 provider 两次推理各自收到的请求。
-async fn run_turn(
-    write_on_call: &'static str,
-    use_state_machine: bool,
-) -> Result<Vec<super::dummy_api::ApiCall>> {
+async fn run_turn(write_on_call: &'static str) -> Result<Vec<super::dummy_api::ApiCall>> {
     let api = Arc::new(DummyApi::start(ProviderFeatures::default()).await);
     let api_client = goose_providers::api_client::ApiClient::new_with_tls(
         api.uri(),
@@ -161,7 +158,6 @@ async fn run_turn(
         session_manager,
         Arc::new(PermissionManager::new(state_dir.join("permissions"))),
         None,
-        GooseMode::Auto,
         true,
         GoosePlatform::GooseCli,
     )
@@ -184,6 +180,7 @@ async fn run_turn(
     agent
         .extension_manager
         .add_client(
+            &session.id,
             ExtensionConfig::Platform {
                 name: "expert".to_string(),
                 description: "Expert switch test extension".to_string(),
@@ -206,13 +203,11 @@ async fn run_turn(
         id: session.id.clone(),
         schedule_id: None,
         max_turns: Some(4),
-        retry_config: None,
     };
     let mut stream = agent
         .reply(
             Message::user().with_text("pick an expert"),
             session_config,
-            use_state_machine,
             Some(CancellationToken::new()),
         )
         .await?;
@@ -224,21 +219,18 @@ async fn run_turn(
     assert_eq!(
         extension.selects.load(Ordering::SeqCst),
         1,
-        "state_machine={use_state_machine}：select 没被调到——下面的断言全是假绿"
+        "select 没被调到——下面的断言全是假绿"
     );
     let calls = api.calls();
-    assert_eq!(
-        calls.len(),
-        2,
-        "state_machine={use_state_machine}：应当恰好两次推理：一次出工具调用、一次收尾"
-    );
+    assert_eq!(calls.len(), 2, "应当恰好两次推理：一次出工具调用、一次收尾");
     Ok(calls)
 }
 
-/// ⭐ 经典循环：工具执行期间换了专家 ⇒ **同一轮**第二次推理就是新专家，旧专家不在。
+/// ⭐ 工具执行期间换了专家 ⇒ **同一轮**第二次推理就是新专家，旧专家不在。
 #[tokio::test]
-async fn classic_loop_rebuilds_system_prompt_within_the_turn_when_extras_change() -> Result<()> {
-    let calls = run_turn(EXPERT_B, false).await?;
+async fn state_machine_rebuilds_system_prompt_within_the_turn_when_extras_change() -> Result<()>
+{
+    let calls = run_turn(EXPERT_B).await?;
     assert!(calls[0].system_contains(EXPERT_A));
     assert!(!calls[0].system_contains(EXPERT_B));
     assert!(calls[0].system_contains(&build_marker(1)));
@@ -254,10 +246,10 @@ async fn classic_loop_rebuilds_system_prompt_within_the_turn_when_extras_change(
     Ok(())
 }
 
-/// 经典循环：同 key 同正文重写后，逐次推理刷新仍保留相同正文。
+/// 同 key 同正文重写后，逐次推理刷新仍保留相同正文。
 #[tokio::test]
-async fn classic_loop_keeps_extras_when_rewritten_unchanged() -> Result<()> {
-    let calls = run_turn(EXPERT_A, false).await?;
+async fn state_machine_keeps_extras_when_rewritten_unchanged() -> Result<()> {
+    let calls = run_turn(EXPERT_A).await?;
     assert!(calls[1].system_contains(EXPERT_A));
     assert!(
         calls[1].system_contains(&build_marker(2)),
@@ -267,15 +259,5 @@ async fn classic_loop_keeps_extras_when_rewritten_unchanged() -> Result<()> {
         !calls[1].system_contains(EXPERT_B),
         "同正文重写不能改变专家片段"
     );
-    Ok(())
-}
-
-/// 对照：状态机循环本来就每次推理前重建，两条循环在「换专家同轮生效」上行为一致。
-#[tokio::test]
-async fn state_machine_loop_also_applies_the_new_extras_within_the_turn() -> Result<()> {
-    let calls = run_turn(EXPERT_B, true).await?;
-    assert!(calls[0].system_contains(EXPERT_A));
-    assert!(calls[1].system_contains(EXPERT_B));
-    assert!(!calls[1].system_contains(EXPERT_A));
     Ok(())
 }
