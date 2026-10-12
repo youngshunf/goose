@@ -231,8 +231,7 @@ async fn run_turn(write_on_call: &'static str) -> Result<Vec<super::dummy_api::A
 
 /// ⭐ 工具执行期间换了专家 ⇒ **同一轮**第二次推理就是新专家，旧专家不在。
 #[tokio::test]
-async fn state_machine_rebuilds_system_prompt_within_the_turn_when_extras_change() -> Result<()>
-{
+async fn state_machine_rebuilds_system_prompt_within_the_turn_when_extras_change() -> Result<()> {
     let calls = run_turn(EXPERT_B).await?;
     assert!(calls[0].system_contains(EXPERT_A));
     assert!(!calls[0].system_contains(EXPERT_B));

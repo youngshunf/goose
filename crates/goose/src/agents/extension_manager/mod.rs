@@ -2432,9 +2432,7 @@ mod tests {
         let manager = extension_manager;
         let first_fetch = {
             let manager = manager.clone();
-            tokio::spawn(async move {
-                manager.scope_lease("session").await.tools().await.unwrap()
-            })
+            tokio::spawn(async move { manager.scope_lease("session").await.tools().await.unwrap() })
         };
 
         let _started = tools_client.first_fetch_started.acquire().await.unwrap();
@@ -2444,12 +2442,7 @@ mod tests {
         let stale_result = first_fetch.await.unwrap();
         assert!(stale_result.iter().any(|tool| tool.name == "dynamic__old"));
 
-        let refreshed = manager
-            .scope_lease("session")
-            .await
-            .tools()
-            .await
-            .unwrap();
+        let refreshed = manager.scope_lease("session").await.tools().await.unwrap();
         assert!(refreshed.iter().any(|tool| tool.name == "dynamic__new"));
         assert_eq!(tools_client.calls.load(Ordering::SeqCst), 2);
     }

@@ -84,9 +84,7 @@ async fn reply_against(error: ProviderError) -> Result<Outcome> {
     })
 }
 
-async fn reply_with_provider(
-    provider: Arc<dyn Provider>,
-) -> Result<(Vec<Message>, Vec<Message>)> {
+async fn reply_with_provider(provider: Arc<dyn Provider>) -> Result<(Vec<Message>, Vec<Message>)> {
     let temp_dir = tempfile::tempdir()?;
     let state_dir = temp_dir.path().join("state");
     let session_manager = Arc::new(SessionManager::new(state_dir.clone()));

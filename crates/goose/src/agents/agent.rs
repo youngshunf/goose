@@ -9,6 +9,7 @@ use tracing_futures::Instrument;
 
 use super::gen_ai_telemetry;
 use super::mcp_client::GooseMcpHostInfo;
+use super::prompt_manager::PromptManager;
 use super::tool_confirmation_coordinator::{
     ActiveTurnGuard, ConfirmationAnswer, ToolConfirmationCoordinator,
 };
@@ -35,7 +36,6 @@ use crate::agents::AgentEvent;
 use crate::config::extensions::name_to_key;
 use crate::config::permission::PermissionManager;
 use crate::config::{Config, GooseMode};
-use super::prompt_manager::PromptManager;
 use crate::conversation::message::{ActionRequiredData, Message, MessageContent};
 use crate::permission::permission_inspector::PermissionInspector;
 use crate::permission::{Permission, PermissionConfirmation};
