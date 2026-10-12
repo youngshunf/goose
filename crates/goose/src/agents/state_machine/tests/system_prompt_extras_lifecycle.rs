@@ -181,15 +181,18 @@ async fn run_turn(write_on_call: &'static str) -> Result<Vec<super::dummy_api::A
         .extension_manager
         .add_client(
             &session.id,
-            ExtensionConfig::Platform {
+            // 必须是 Builtin：`EnabledExtensionsState` 读回时会过滤掉注册表外的
+            // Platform 扩展（`is_extension_available`），租约按会话记录构建。
+            ExtensionConfig::Builtin {
                 name: "expert".to_string(),
                 description: "Expert switch test extension".to_string(),
                 display_name: None,
+                timeout: None,
                 bundled: None,
                 available_tools: vec![],
             },
             extension.clone(),
-            None,
+            extension.get_info().cloned(),
         )
         .await;
     agent

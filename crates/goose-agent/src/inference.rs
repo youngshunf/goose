@@ -540,7 +540,11 @@ impl<S: MaybeSync, E: InferenceEffect> Inference<S, E> for InferenceRunner<'_, S
                 break empty_output;
             }
             self.output().accumulator.clear();
-            if empty_responses < MAX_EMPTY_RESPONSE_RETRIES {
+            // 唤星 `#5` 在状态机唯一路径上的落点：零重试 provider 的空轮是非幂等请求的
+            // 成功空响应，发一次即终态，不得重放；默认配置保持上游 1+3 不变。
+            if empty_responses < MAX_EMPTY_RESPONSE_RETRIES
+                && self.provider.retry_config().max_retries > 0
+            {
                 empty_responses += 1;
                 tracing::warn!(
                     "Provider returned an empty response; retrying ({empty_responses}/{MAX_EMPTY_RESPONSE_RETRIES})"

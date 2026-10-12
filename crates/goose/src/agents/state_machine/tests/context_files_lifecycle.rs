@@ -26,6 +26,7 @@ use tokio_util::sync::CancellationToken;
 use super::calculator_extension::{CalculatorExtension, ADD};
 use super::dummy_api::{DummyApi, ProviderFeatures};
 use crate::agents::extension::ExtensionConfig;
+use crate::agents::mcp_client::McpClientTrait;
 use crate::agents::{Agent, AgentConfig, GoosePlatform, SessionConfig};
 use crate::config::permission::PermissionManager;
 use crate::config::GooseMode;
@@ -128,15 +129,18 @@ async fn hint_markers_per_inference(
         .extension_manager
         .add_client(
             &session.id,
-            ExtensionConfig::Platform {
+            // 必须是 Builtin：`EnabledExtensionsState` 读回时会过滤掉注册表外的
+            // Platform 扩展（`is_extension_available`），租约按会话记录构建。
+            ExtensionConfig::Builtin {
                 name: "calculator".to_string(),
                 description: "Stateful test calculator".to_string(),
                 display_name: None,
+                timeout: None,
                 bundled: None,
                 available_tools: vec![],
             },
             calculator.clone(),
-            None,
+            calculator.get_info().cloned(),
         )
         .await;
 

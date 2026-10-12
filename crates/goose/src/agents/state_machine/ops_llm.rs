@@ -209,6 +209,11 @@ impl Provider for GooseInferenceProvider {
     async fn fetch_model_info(&self, model_name: &str) -> Result<ModelInfo, ProviderError> {
         self.inner.fetch_model_info(model_name).await
     }
+
+    // 透传内层 provider 的重试配置：空轮重试闸（goose-agent inference）读的是本包装。
+    fn retry_config(&self) -> goose_providers::retry::RetryConfig {
+        self.inner.retry_config()
+    }
 }
 
 #[cfg(test)]
