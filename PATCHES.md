@@ -121,6 +121,16 @@ relay 404 重试耗尽后，经典循环把 `ProviderError` 压成一条普通 a
 ⛔ 不构成放宽；落地依据是上述行为裁决本身——不打 patch 就只能做「下一次 `reply()` 生效」，
 那与裁决不符。
 
+### 2026-10-13：`#9` 施工登记
+
+施工分支 `feat/skills-discovery-gate`；worktree
+`/Users/mac/openclaw-workspace/huanxing/huanxing-project/.worktrees/goose-skill-gate`；
+基点 `aefd459c0`（`hasn`，含 2026-10-12 第四次上游同步）。**裁剪类**（主人 2026-10-13 裁决：
+文件系统技能发现默认关；编程开发场景需要「工作目录里发现的技能」⇒ 开的时候只放工作目录源），
+不是内核逻辑第三类，不触发单独裁决要求；本片只改 fork，不合回 `hasn`、不推送。
+⚠️ 与「薄 patch 缺省行为逐字节不变」惯例的**差异**：本 patch 的缺省（`Disabled`）相对上游
+是**有意的默认关闭**——上游既有行为是默认扫描并注入，这正是裁剪目的。
+
 ## 改动登记
 
 | # | 改动点 | 类别 | 理由 | 上游回馈可能性 |
@@ -134,6 +144,7 @@ relay 404 重试耗尽后，经典循环把 `ProviderError` 压成一条普通 a
 | 7 | `crates/goose/src/agents/prompt_manager.rs`：`PromptManager` 新增 extras **内容版本** `system_prompt_extras_revision`（`add_system_prompt_extra` 只在正文真的变了才写并 +1、`remove_system_prompt_extra` 只在真的摘掉一格才 +1，＋ 只读访问器）；`agents/agent.rs`：经典 reply 循环在建 system prompt 前记下版本，工具执行之后与既有 `has_new_hints` 并列判 `extras_changed`，**复用既有** `prepare_tools_and_prompt` 重建，`tools_updated` 那一支同步记版本；`Agent` 新增私有 `system_prompt_extras_revision()`。测试在 `prompt_manager.rs` 一条单测与新文件 `agents/state_machine/tests/system_prompt_extras_lifecycle.rs`（模块登记在 `tests/mod.rs`） | 内核逻辑（据主人「专家同轮下一次推理生效」行为裁决实施，**没有**主人另行「内核可改」单条裁决） | 经典循环只在 `tools_updated` 或新子目录 hints 时循环内重建 system prompt，嵌入方在工具执行期间经公开的 `extend_system_prompt`/`remove_system_prompt_extra` 改了 extras，要到下一次 `reply()` 才生效；状态机路径每次推理前本就重建（`inference_preparation.rs`），两条路行为不一致 | 🟢 **高**。让公开 extras API 在同一轮内生效是通用语义，缺省（不改 extras）行为逐字节不变，与唤星业务零耦合。PR 材料见下节，尚未对外提交 |
 
 | 8 | `crates/goose-provider-types/src/base.rs`：深化既有 `Provider`，新增与 `stream` 同入参的 `stream_main`，默认委托原 `stream`；`crates/goose/src/agents/reply_parts.rs`：共用主响应入口的初始请求与首响应前重试两处改用 `stream_main`；测试扩充既有 `crates/goose/tests/session_id_propagation_test.rs` | 内核接入的窄公开接缝（专家 E5，依据父仓提示词体系 `06-会话装配与执行上下文契约.md` §5.4） | 经典循环与状态机必须在调用宿主 provider 前证明主请求用途；辅助 `complete`/direct `stream` 可使用同一 session，不能按文本或 session 猜用途。只新增一个默认方法，不增加 hook、用途枚举或全局请求状态；普通 provider 保持原消息与 usage，辅助请求不变 | 高。通用嵌入方按请求用途区分主推理与辅助调用，与唤星应用回执零耦合；本片不包含 Node Adapter 覆写、回执实现或依赖改钉，未向上游提交 |
+| 9 | `crates/goose/src/agents/agent.rs`：`FilesystemSkills` 枚举（`Disabled` 默认 / `WorkingDirectory`）＋ `AgentConfig.filesystem_skills` 字段与 `with_filesystem_skills`（`AgentConfig::new` 签名不变，照 `#2` 先例），装配处把档位传给 `SkillOperation`；`agents/mod.rs` 导出枚举；`agents/state_machine/ops_skills.rs`：`SkillOperation` 按档位管三处——`inference_tools`（`Disabled` ⇒ 不广告 `load_skill`）、`prompt_parts`（`Disabled` ⇒ 不注入 `# Skills` 段；`WorkingDirectory` ⇒ 只留 `SourceEntry.global == false` 的来源，home/全局配置目录/内置技能被同一过滤排除）、`execute_skill`（`Disabled` ⇒ 具名失败不读文件；`WorkingDirectory` ⇒ 同一过滤）。生产 **+93 / −14**，测试与夹具 **+375 / −12**（含存量 6 条技能测试显式开 `WorkingDirectory`） | 裁剪（主人 2026-10-13 裁决，见上方施工登记） | 上游 `SkillOperation` 无条件挂在状态机 operations 表，每次推理前扫文件系统并把 `# Skills` 段与无前缀 `load_skill` 注入系统提示词；唤星侧已有自己的技能链（快照唯一来源 + `hasn_skills__load_skill`），上游这条是旁路，但编程开发场景需要「工作目录里发现的技能」⇒ 默认关、开只放工作目录源。⚠️ 缺省相对上游是**有意的默认关闭**，与「缺省逐字节不变」惯例不同 | 🟢 高。上游 CLI 用户可能也想要「关掉技能发现」的开关；PR 材料不备，先登记 |
 
 > 加一条 patch 就在上表加一行，**不要攒着**。评审判据是：
 > 这张表的行数 == `git diff upstream/main...hasn` 里非裁剪类改动的处数。
@@ -416,6 +427,75 @@ session::session_manager::tests::create_session`）：
   `ok. 2356 passed; 0 failed`（rc=0）；同 feature 集 `cargo clippy -p goose --lib --tests -- -D warnings` rc=0
   （有 `Checking goose` 行）；`cargo fmt --all -- --check`、`git diff --check` rc=0；消费形态
   `cargo check -p goose -p goose-providers -p goose-provider-types --lib --no-default-features` rc=0。
+
+### `#9` 的最小性、行为与证伪
+
+基点 `aefd459c0`，实现提交 `453298afa`。
+
+- **改动面**（`git show 453298afa --numstat`）：9 个文件 **+468 / −26**。生产 **+93 / −14**：
+  `agent.rs` +40/−4（枚举 + 字段 + 构造器默认值 + `with_filesystem_skills` + 装配一处转交）、
+  `agents/mod.rs` +1/−1（导出行）、`ops_skills.rs` 非测试部分 +52/−9（`discovered_skills` 档位
+  助手、`execute_skill` 把守、`inference_tools`/`prompt_parts`/`run` 三个消费点、`SkillOperation`
+  字段与 builder）。测试与夹具 **+375 / −12**：新文件 `state_machine/tests/filesystem_skills_gate.rs`
+  +169、`agent_reply.rs` +83/−3、`ops_skills.rs` 测试模块 +80、`pipeline.rs` +15/−6（夹具透传档位，
+  缺省与生产一致为 `Disabled`）、`hooks_lifecycle.rs` +13/−3、`prompt_skill_lifecycle.rs` +3、
+  `tests/mod.rs` +1。删除的 26 行全是被替换的原表达式（`skill_instructions`/`execute_skill` 签名与
+  函数体内的 `discover_skills` 调用、两处 `SkillOperation::new(...)` 装配为接上链式调用的重排、
+  存量 6 条技能测试显式开档的适配）。
+- **构造入口零改动**：`AgentConfig::new` 五参签名一字未动，只多一行
+  `filesystem_skills: FilesystemSkills::Disabled`；`SkillOperation::new` 签名未动（档位走
+  `with_filesystem_skills`，照 `#2` `with_context_file_names` 先例）。全仓 `AgentConfig {` 字面量
+  构造 0 处（`#2` 已核），新增 `pub` 字段不破坏任何现有构造。
+- **行为契约（两档语义）**：
+  - `Disabled`（缺省）：不扫文件系统、`inference_tools` 返回空表（不广告无前缀 `load_skill`）、
+    `prompt_parts` 不产出 `# Skills` 段；模型硬发 `load_skill` 时——若请求带 inference 元数据，
+    广告面核对（`request_was_advertised`）先拦下，落 `UnknownToolOperation` 具名失败
+    「Tool 'load_skill' is not available.」；若请求无 inference 元数据（绕过广告面），
+    `execute_skill` 的档位把守具名失败「Tool 'load_skill' is disabled: …」，不读任何技能文件。
+  - `WorkingDirectory`：广告 `load_skill`；`# Skills` 段与 `load_skill` 执行都只认
+    `SourceEntry.global == false` 的来源（`<workdir>/.agents|.goose|.claude/skills` 与项目级插件
+    技能目录）；home、`Paths::config_dir()/skills`、`~/.claude/skills`、`~/.config/agents/skills`
+    与内置技能（`global == true`）被同一过滤排除——内置技能被排掉正是意图。
+  - ⚠️ **缺省行为变化的差异声明**：其他薄 patch 的缺省是「逐字节不变」，本 patch 的缺省是
+    **有意的默认关闭**（主人 2026-10-13 裁决）——fork 内 CLI/Desktop 不再默认扫描与注入文件系统
+    技能，`/skills` 斜杠命令（用户面，不经推理面）未动。fork 的 CLI 不是唤星消费面。
+  - ⚠️ `summon` 派生的子 Agent 自建 `AgentConfig`，**不继承**本字段（与 `#2` 同格）。
+- **档位生效时机（消费方接线关键事实）**：状态机 operations 表**每次 reply 重建**
+  （`reply_with_state_machine_inner` → `stream_state_machine_session` → `create_state_machine`，
+  确认恢复也走同一入口），装配时现读 `self.config.filesystem_skills`。⇒ **按轮翻档成立**：
+  node 在两轮之间改写 `agent.config.filesystem_skills`（`Agent.config` 与该字段都是 `pub`，
+  不需要新增 setter）即可——有文件授权根 ⇒ `WorkingDirectory`，否则 `Disabled`；
+  不是 Agent 池粒度。`agent_reply.rs` 的
+  `filesystem_skills_working_directory_advertises_load_skill_and_workdir_skill` 正是用
+  构造后改写 `agent.config` 的方式证明这条链。
+- **先红后绿**（feature 集 `rustls-tls,code-mode,tree-sitter,live-voice,scheduler,platform-apps,chat-recall,acp-http`，`--locked --test-threads=1`，`RUST_MIN_STACK=8388608`，`CARGO_PROFILE_TEST_DEBUG=0`）：
+  实现前先写 3 条「默认关」用例跑在**未改的生产代码**上（过滤 `filesystem_skills`），
+  rc=101、3 条全红——`filesystem_skills_disabled_by_default_advertises_no_load_skill` 与
+  `disabled_by_default_hides_load_skill_and_skills_section` 红在「不得广告 load_skill」，
+  `disabled_mode_hard_sent_load_skill_fails_by_name_without_reading_files` 红得最有说服力：
+  硬发的调用**真把技能读出来了**（ToolResponse 是 `# Loaded Skill: demo … DEMO_SKILL_BODY`
+  而非具名失败）。实现后同过滤项 18 条全绿 rc=0。
+- **变异**（每条变异单独一次编译，跑完还原再复跑；过滤 `filesystem_skills ops_skills`）：
+
+  | 源码 | 结果 |
+  |---|---|
+  | 原样（还原后复跑） | `ok. 18 passed; 0 failed`，rc=0 |
+  | **M1** `WorkingDirectory` 去掉 `.filter(\|source\| !source.global)` | rc=101，恰 2 条红：`working_directory_execute_does_not_load_global_skills`（全局技能被读出来了）与 `working_directory_mode_lists_workdir_skill_and_hides_global_skills`（`GLOBAL_ONLY_DESC` 漏进 `# Skills`） |
+  | **M2** 去掉 `execute_skill` 的 `Disabled` 把守 | rc=101，恰 1 条红：`disabled_execute_fails_by_name_without_reading_files`（红在具名失败文案——把守拿掉后落「Skill 'demo' not found」，因为 `discovered_skills` 的 `Disabled` 支仍在；e2e 硬发那条仍绿，它由广告面核对兜住，把守防的是无 inference 元数据的旁路）。阶段 1 的红已证明双把守全无时文件真的被读 |
+  | **M3** `inference_tools` 恒广告（去掉 `Disabled` 早退） | rc=101，恰 3 条红：两条默认关断言（广告面）＋ e2e 硬发那条（广告恢复后硬发调用真的执行了技能加载，响应从「not available」变成技能正文） |
+
+- **验证表**（本机 2026-10-13，`CARGO_TARGET_DIR` 为本 worktree 独立外置 target，
+  构建 `CARGO_BUILD_JOBS=2`）：
+
+  | 验证 | 命令与结果 |
+  |---|---|
+  | 消费形态 | `cargo check -p goose -p goose-providers -p goose-provider-types --lib --no-default-features`，rc=0 |
+  | 新测试 + 受影响存量 | `cargo test -p goose --lib --no-default-features --features <同上集> --locked -- filesystem_skills ops_skills prompt_skill_lifecycle load_skill skill_approval --test-threads=1`，`ok. 18 passed; 0 failed`，rc=0（含适配后的 `prompt_and_skill_lifecycle`、3 条 `hooks_lifecycle` load_skill 钩子用例、2 条 `agent_reply` 技能批准用例、`unadvertised_load_skill_is_neither_approved_nor_loaded` 在默认关下原样绿） |
+  | 影响面回归 | 同 feature 集 `-- agents::state_machine:: skills:: --test-threads=1`，`ok. 192 passed; 0 failed`，rc=0 |
+  | Clippy | `cargo clippy -p goose --lib --tests --no-default-features --features <同上集> --locked -- -D warnings`，rc=0，有 `Checking goose` 行 |
+  | 格式 | 本片 9 个文件 `rustfmt --edition 2021 --check` 首轮 4 个有出入（import 换行、链式调用折行），格式化后复验 rc=0；fmt 后同过滤项复跑 18 条全绿 rc=0；`git diff --check` rc=0 |
+
+  未运行：全量 lib（2026-10-12 同步已背书，本片面窄）、E2E（未获授权）。
 
 ## 上游 PR 材料（⚠️ 尚未提交）
 
@@ -1443,6 +1523,7 @@ resolver 2 在只编 lib 时**不做 dev-dep 的 feature 合一** ⇒ `cargo che
 - 系统提示词覆盖走会话行：`session_manager.update(id).system_prompt_override(...)`（`Agent::override_system_prompt` 上一轮就没了）；
 - `Agent::list_tools` 返回 `Result<Vec<Tool>>`（我方 `list_tools_strict` 已不存在；严格模式经 `AgentConfig::with_strict_tool_list` + 这条 `Result` 上浮具名失败）；
 - 2026-10-08 节已登记、节点仍未适配的项本轮继续有效：`ExtensionManager::add_client(config, client, info)`（🔴 注意本轮起第一参是 `session_id`，且测试/宿主注入的 Platform 扩展必须已在 PLATFORM_EXTENSIONS 注册、否则被 `is_extension_available` 过滤出会话选择）、按会话异步的 `McpClientTrait`、`with_data_dir`、租约调用。
+- `#9`（2026-10-13，文件系统技能发现开关）的接线方式：node 按轮 set——有文件授权根 ⇒ `AgentConfig::with_filesystem_skills(FilesystemSkills::WorkingDirectory)`，否则 `Disabled`（缺省）。关键事实：状态机 operations 表**每次 reply 重建**（`stream_state_machine_session` → `create_state_machine`），装配时现读 `agent.config.filesystem_skills`（`Agent.config` 与该字段均为 `pub`）⇒ node 在两轮之间改写该字段即可按轮翻档，**不是** Agent 池粒度、不需要重建 Agent，也不需要新增 setter。
 
 ## 消费方
 
