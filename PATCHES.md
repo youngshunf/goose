@@ -1379,6 +1379,71 @@ resolver 2 在只编 lib 时**不做 dev-dep 的 feature 合一** ⇒ `cargo che
 
 未运行：完整 Goose/CLI/SDK 测试、产品 E2E（未获本轮授权）、完整跨仓 rev bump 验收、桌面 UI 验证。测试链接器曾提示 `__eh_frame` 超过 compact unwind 表大小，测试执行成功；未将此提示写成 lint 通过或故障掩盖。
 
+### 2026-10-12：第四次上游同步（距上次 4 天）
+
+| 项 | 值 |
+|---|---|
+| 上游 HEAD | `4617040c7`（`Update homepage stats (#12848)`） |
+| 上一基点 | `9560429ff982bbfecec5094963e5f34696b63a1c` |
+| 上游提交数 | 19 |
+| 合并方式 | 父仓 `.worktrees/goose-upstream-20261012`（`merge/goose-upstream-20261012`）合并验证，合并提交 `cd5308f62`；验证中修复 `af703516c`、fmt `5767d45a7`；待快进主 clone 的 `hasn`，不重写已发布历史 |
+| 上游版本与工具链 | `1.54.0` → `1.54.0`（本轮是 1.54 发布后追加）；`channel` 仍 `1.99.0` |
+| workspace crates | 15 个，集合未变 |
+
+#### 🔴 本轮轴心：上游 `3b094d7af` 删除经典 Agent::reply 循环，状态机成唯一路径
+
+- `Agent::reply` 签名变为 `(user_message, session_config, cancel_token)`——`use_state_machine` 参数没了；
+- `AgentConfig.goose_mode` 字段被上游删除（goose_mode 只住会话行）；
+- `Agent::list_tools` 上游自己改成 `-> Result<Vec<Tool>>`，我方 `list_tools_strict` 入口被吞并（严格模式下目录失败经租约 `?` 具名上浮，语义等价）；
+- ⚠️ 订正口径：`Agent::override_system_prompt` **不是本轮删的**——它在上一轮已合入的 `8c0c409a8`（#12730）里就没了；原生接缝是会话行 `system_prompt_override`（`Session` 字段 + `SessionUpdateBuilder::system_prompt_override`，`PromptManager::build` 有 override 时整份替换基底）；
+- `Agent` 不再持有 `current_goose_mode`/`final_output_tool`/`tool_confirmation_router`；`goose-agent` crate 的 `InferenceRunner` 成为唯一推理内核，且**新长出空响应重试**（`MAX_EMPTY_RESPONSE_RETRIES=3`，见下「#5」）。
+
+#### 冲突清单与解法摘要
+
+9 个冲突文件：`agent.rs`（6 处：import 取上游+补 PromptManager import；结构体初始化取上游+融合 `with_strict_tool_list` 与 `prompt_manager` 字段；`list_tools` 取上游 fallible 签名；`ToolExecutionOperation` 取上游 3 参+保留 `with_context_file_names`；经典循环整块约 2200 行随上游删除；尾部经典循环测试块随上游删除）、`prompt_manager.rs`（8 处全取我方——PromptManager 保持有状态：宿主 extras、内容版本、context_file_names、子目录 hints 跟踪器）、`reply_parts.rs`（2 处取上游删除：`prepare_tools_and_prompt` 与 `categorize_tool_requests` 的我方测试随被删函数消失；`stream_main` 两处调用点不在冲突区、自动存活）、`extension_manager/mod.rs`（5 处：import 融合；`scope_lease` 取上游；3 处测试取上游 #12775 新语义+我方 fallible `tools()` 补 `unwrap`）、`extension_manager/lease.rs`（1 处融合：`get_or_try_init` × `start_extensions()`，F-3 可失败目录 × #12775 首次使用拉起）、`code_execution.rs`（2 处测试取上游租约获取+我方 `unwrap`）、`ops_toolcalling.rs`（3 处：我方 `with_context_file_names` 与上游 `take_batch`/可失败 `lease()` 并存；`moim_parts` 双 `?`；`prompt_parts` 保留我方文件名表分支+上游 `is_agent_visible` 过滤）、`tests/mcp_integration_test.rs`（3 处取上游 #12775 语义+我方 `unwrap`）、`tests/providers.rs`（1 处融合）。
+
+冲突外的必要迁移接线：`state_machine/inference_preparation.rs` 重新接回 `prompt_manager: &'a Mutex<PromptManager>`（上游把它改成无状态 `PromptManager::new()`，不接回则宿主 extras 与 context_file_names 到不了状态机提示词）与 `tests/pipeline.rs` 同步加字段；`ops_llm.rs` 我方 #6 用例适配上游改名后的 `prepare_tool_requests`；三条 lifecycle 测试文件与 `tests/session_id_propagation_test.rs` 去掉 `use_state_machine` 维度、`AgentConfig::new` 六参改五参、`SessionConfig` 去掉被上游删除的 `retry_config` 字段。
+
+#### 薄 patch 去向
+
+| # | 去向 |
+|---|---|
+| 1 | **在**（`session_manager.rs` 本轮无冲突，方法与两条单测原样，验证 1 绿） |
+| 2 | **在**。穿透链变为 `AgentConfig` → `PromptManager`（状态机每次推理前经 preparer 用 Agent 持有的 manager 重建，`with_hints` 读表）+ `ToolExecutionOperation::with_context_file_names`；经典循环的子目录 hints 读路随循环消失，状态机那条保留 |
+| 3 | 经典循环侧随循环消失；状态机本就用 `Message::from_provider_error`，三条终态错误用例收成单路径保留（验证 1 绿） |
+| 4 | **在**（goose-providers 无冲突） |
+| 5 | 经典循环侧随循环消失。**注意：上游把空轮重试新做进了 goose-agent `InferenceRunner`（固定 1+3、原来状态机只发一次的保证被上游自己打破）**。本轮把零重试闸迁到新落点：`goose-agent/src/inference.rs` 空响应重试增加 `provider.retry_config().max_retries > 0` 守卫（默认 1+3 不变），`GooseInferenceProvider` 透传 `retry_config()` 到内层 provider。`state_machine_does_not_replay_zero_retry_empty_turn`（1 次调用 + 既有文案）复绿。⛔ 这张表多了一处非裁剪改动位置（`crates/goose-agent`），「行数 == diff 处数」的判据本轮起不再成立 |
+| 6 | **在**（`recover_mangled_tool_name` 的 sanitize 认回与命中即 `return None` 逐字存活；ops_llm 用例适配新函数名后绿） |
+| 7 | **在**。经典循环的版本比对触发器随循环消失；状态机每次推理前本就重建，同轮生效由 preparer 接回的 Agent 级 PromptManager 承载；extras 内容版本（同 key 同正文不推进、摘不到不推进）与「宿主 extras 不被 session/operation 旧正文覆盖」语义与单测全保留 |
+| 8 | **在**（`stream_main` 默认委托 + reply_parts 两处调用点存活；状态机经 `GooseInferenceProvider::stream` → `stream_response_from_provider` → `stream_main`，`session_id_propagation_test` 5 条全绿含主请求用途见证） |
+| F-3 | **在**。链路 `AgentConfig::strict_tool_list` → `ExtensionManager::with_strict_tool_list` → `ExtensionLease::new` → `ToolCatalog::build(strict)` → `fetch_public_tools` 具名上浮；两条严格测试迁到 `scope_lease` 后绿 |
+
+#### 验证（本机，2026-10-12；`CARGO_TARGET_DIR` 为本 worktree 独立外置 target，测试 `RUST_MIN_STACK=8388608`、`CARGO_PROFILE_TEST_DEBUG=0`、`--test-threads=1`，构建 `CARGO_BUILD_JOBS=2`）
+
+| 验证 | 命令与结果 |
+|---|---|
+| 节点最小消费形态 | `cargo check -p goose -p goose-providers -p goose-provider-types --lib --no-default-features`，rc=0 |
+| 薄补丁回归 | 同上轮命令与 feature 集，`94 passed; 0 failed`，rc=0；各过滤项命中：prompt_manager 21、extension_manager 27、reply_parts 36、context_files_lifecycle 2、system_prompt_extras_lifecycle 2、provider_errors_lifecycle 4、create_session 2 |
+| 租约消费者回归 | 同上轮过滤项，`30 passed; 0 failed`，rc=0；命中：moim 6、code_execution 15、agent_reply 9。⚠️ `agents::state_machine::ops_llm::tests::` 与 `agents::state_machine::tests::pipeline::` 命中 **0 条**（ops_llm 测试模块现名 `canonicalization_tests`；pipeline.rs 是纯夹具），不算覆盖；补跑 `ops_llm::canonicalization_tests::` 6 条全绿（含 #6 用例），rc=0 |
+| session_id 传播 | `cargo test -p goose --test session_id_propagation_test --no-default-features --features <同上> --locked -- --test-threads=1`，`5 passed; 0 failed`，rc=0 |
+| Provider 与格式 | 同上轮命令，goose-provider-types `631 passed`、goose-providers `267 passed`，rc=0 |
+| goose 全量 lib | 同 feature 集不加过滤，`2286 passed; 0 failed`，rc=0 |
+| Clippy | 同上轮五 crate 命令，rc=0，有 `Checking goose`、`Checking goose-cli`、`Checking goose-sdk` 行 |
+| 格式与冲突 | 本合并触及的 24 个 Rust 文件 `rustfmt --edition 2021 --config skip_children=true --check` 首轮 4 个文件有出入（import 排序/换行），只对这 4 个文件格式化（`5767d45a7`）后复验 rc=0；`git diff --check` rc=0；`git ls-files -u` 为空 |
+
+**失败与修复留痕**：薄补丁回归首轮 89 过 5 红（rc=101）。两类成因：① 我方三条 lifecycle 测试用 `ExtensionConfig::Platform` 注入测试扩展——`EnabledExtensionsState::from_extension_data` 读回时 `retain(is_extension_available)` 会过滤掉注册表外的 Platform 扩展（旧架构租约从 scopes 构建、不经过这条过滤；#12775 后租约按会话记录构建才暴露），改用上游同款 `Builtin` 配置并传 `info` 后绿；② 空轮重试迁入 goose-agent 后不认零重试配置（见上「#5」）。均在 `af703516c` 修复，未删断言。fmt 在验证 5 之后落 `5767d45a7`，仅 import 顺序与换行。
+
+未运行：goose-cli/goose-server 测试、`tests/` 下其余集成测试（`tests/providers.rs` 需外网）、E2E（未获本轮授权）。
+
+#### 消费方升级边界（hasn-node rev bump 时一并吃）
+
+本轮仍不改 `hasn-node` 的 rev。bump 时适配清单：
+
+- `Agent::reply(message, session_config, cancel_token)`——去掉 `use_state_machine` 实参；
+- 系统提示词覆盖走会话行：`session_manager.update(id).system_prompt_override(...)`（`Agent::override_system_prompt` 上一轮就没了）；
+- `Agent::list_tools` 返回 `Result<Vec<Tool>>`（我方 `list_tools_strict` 已不存在；严格模式经 `AgentConfig::with_strict_tool_list` + 这条 `Result` 上浮具名失败）；
+- 2026-10-08 节已登记、节点仍未适配的项本轮继续有效：`ExtensionManager::add_client(config, client, info)`（🔴 注意本轮起第一参是 `session_id`，且测试/宿主注入的 Platform 扩展必须已在 PLATFORM_EXTENSIONS 注册、否则被 `is_extension_available` 过滤出会话选择）、按会话异步的 `McpClientTrait`、`with_data_dir`、租约调用。
+
 ## 消费方
 
 `hasn-node` 经 cargo git 依赖消费本仓，`rev` 钉死、**不跟分支**：
