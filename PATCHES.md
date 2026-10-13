@@ -131,6 +131,15 @@ relay 404 重试耗尽后，经典循环把 `ProviderError` 压成一条普通 a
 ⚠️ 与「薄 patch 缺省行为逐字节不变」惯例的**差异**：本 patch 的缺省（`Disabled`）相对上游
 是**有意的默认关闭**——上游既有行为是默认扫描并注入，这正是裁剪目的。
 
+### 2026-10-13：`#10` 原子会话归档施工登记
+
+施工分支 `fix/runtime-session-archive-20261013`；worktree
+`hasn-apps/goose/.worktrees/runtime-session-archive-20261013`；基点 `337fdb009`（`hasn`）。
+由节点工作会话续接修复暴露：`copy_session` 只复制会话配置与 transcript，不复制
+`usage_ledger`；复制后 `delete_session` 会永久删除原每请求账单。需要归档的是原一代
+证据，不是新副本，因此新增窄接口移动原身份与所有已知引用，不改推理循环、schema 或
+既有 copy/delete 行为。不新增主人对内核逻辑的单独裁决，不构成第三类 patch 的普遍放宽。
+
 ## 改动登记
 
 | # | 改动点 | 类别 | 理由 | 上游回馈可能性 |
@@ -145,6 +154,8 @@ relay 404 重试耗尽后，经典循环把 `ProviderError` 压成一条普通 a
 
 | 8 | `crates/goose-provider-types/src/base.rs`：深化既有 `Provider`，新增与 `stream` 同入参的 `stream_main`，默认委托原 `stream`；`crates/goose/src/agents/reply_parts.rs`：共用主响应入口的初始请求与首响应前重试两处改用 `stream_main`；测试扩充既有 `crates/goose/tests/session_id_propagation_test.rs` | 内核接入的窄公开接缝（专家 E5，依据父仓提示词体系 `06-会话装配与执行上下文契约.md` §5.4） | 经典循环与状态机必须在调用宿主 provider 前证明主请求用途；辅助 `complete`/direct `stream` 可使用同一 session，不能按文本或 session 猜用途。只新增一个默认方法，不增加 hook、用途枚举或全局请求状态；普通 provider 保持原消息与 usage，辅助请求不变 | 高。通用嵌入方按请求用途区分主推理与辅助调用，与唤星应用回执零耦合；本片不包含 Node Adapter 覆写、回执实现或依赖改钉，未向上游提交 |
 | 9 | `crates/goose/src/agents/agent.rs`：`FilesystemSkills` 枚举（`Disabled` 默认 / `WorkingDirectory`）＋ `AgentConfig.filesystem_skills` 字段与 `with_filesystem_skills`（`AgentConfig::new` 签名不变，照 `#2` 先例），装配处把档位传给 `SkillOperation`；`agents/mod.rs` 导出枚举；`agents/state_machine/ops_skills.rs`：`SkillOperation` 按档位管三处——`inference_tools`（`Disabled` ⇒ 不广告 `load_skill`）、`prompt_parts`（`Disabled` ⇒ 不注入 `# Skills` 段；`WorkingDirectory` ⇒ 只留 `SourceEntry.global == false` 的来源，home/全局配置目录/内置技能被同一过滤排除）、`execute_skill`（`Disabled` ⇒ 具名失败不读文件；`WorkingDirectory` ⇒ 同一过滤）。生产 **+93 / −14**，测试与夹具 **+375 / −12**（含存量 6 条技能测试显式开 `WorkingDirectory`） | 裁剪（主人 2026-10-13 裁决，见上方施工登记） | 上游 `SkillOperation` 无条件挂在状态机 operations 表，每次推理前扫文件系统并把 `# Skills` 段与无前缀 `load_skill` 注入系统提示词；唤星侧已有自己的技能链（快照唯一来源 + `hasn_skills__load_skill`），上游这条是旁路，但编程开发场景需要「工作目录里发现的技能」⇒ 默认关、开只放工作目录源。⚠️ 缺省相对上游是**有意的默认关闭**，与「缺省逐字节不变」惯例不同 | 🟢 高。上游 CLI 用户可能也想要「关掉技能发现」的开关；PR 材料不备，先登记 |
+
+| 10 | `crates/goose/src/session/session_manager.rs`：新增 `SessionManager::archive_session(id, archived_id)` 及存储层事务，只移动原 `sessions.id` 和 `messages` / `usage_ledger` / 子会话父引用 / 已存在的 `thread_messages` 来源，真实设置 `archived_at`；测试复用同文件真实磁盘 SQLite | 内核存储的窄新增接口（工作会话归档完整性缺陷修复，无新增主人单条裁决） | 复制不保留逐请求账单且会重铸消息行与时间；原子移动身份才能保全上一代证据并释放活跃身份。调用方指定归档 ID，不产生第二本活跃会话账 | 高。通用无损归档能力，缺省与既有 API 不变；未向上游提交 |
 
 > 加一条 patch 就在上表加一行，**不要攒着**。评审判据是：
 > 这张表的行数 == `git diff upstream/main...hasn` 里非裁剪类改动的处数。
@@ -496,6 +507,40 @@ session::session_manager::tests::create_session`）：
   | 格式 | 本片 9 个文件 `rustfmt --edition 2021 --check` 首轮 4 个有出入（import 换行、链式调用折行），格式化后复验 rc=0；fmt 后同过滤项复跑 18 条全绿 rc=0；`git diff --check` rc=0 |
 
   未运行：全量 lib（2026-10-12 同步已背书，本片面窄）、E2E（未获授权）。
+
+### `#10` 的最小性、行为与验证边界
+
+- 仅新增公开委托与存储层 `archive_session`，不改变 `copy_session`、`delete_session`、
+  ID 生成规则、推理循环或迁移。归档 ID 由调用方逐字给定；同 ID 显式拒绝，目标碰撞由
+  主键约束拒绝，缺失原行明确返回 `Session not found`。
+- `BEGIN IMMEDIATE` 覆盖整批移动；`PRAGMA defer_foreign_keys = ON` 只延迟本事务检查，
+  不关闭外键。只更新原行 ID/引用及 `archived_at = CURRENT_TIMESTAMP`，保留原行内部主键、
+  正文、metadata、原创建/更新时间、命名、逐请求模型/token/cache/cost/cost_source 与汇总。
+  子会话父引用跟随，孙会话仍指向原子会话；旧库有 `thread_messages` 时来源同事务跟随，
+  新库确实缺表时不另建表，也不把 SQL 故障吞成缺席。
+- 三条测试走真实磁盘 `sessions.db`：`archive_session_moves_original_rows_and_preserves_evidence_and_children`
+  逐列 SQLite `quote` 比较证据并核外键；`archive_session_rejects_missing_same_id_and_collision_without_changes`
+  核拒绝后全库不变；`archive_session_rolls_back_every_write_failure` 以五个真实 UPDATE trigger
+  的 `RAISE(ABORT)` 逐写点核回滚。线程表由真实 runner 从 v9 执行 10–17 建立，写入夹具前
+  明确断言两张线程表俱在；不复制测试 schema。首轮 ledger 变异的 `rc=101` 失败发生在
+  `no such table: threads` 夹具准备阶段，因此作废，不计作归档行为证伪。
+- API 缺席阶段：主代理在 `/tmp/runtime-session-archive-20261013-api-red.log` 取得 `rc=101`、
+  三处 `E0599`。这只证明接口缺席，不代替数据归档行为证伪。
+- 有效行为红：主代理定向移除原子归档中的 `UPDATE usage_ledger SET session_id`，
+  `/tmp/runtime-session-archive-20261013-ledger-mutation-red2.log` 为 `rc=101`、`2 passed / 1 failed`。
+  线程建表前提通过，唯一失败是成功归档测试在事务提交时触发 SQLite `code: 787`
+  `FOREIGN KEY constraint failed`；拒绝与回滚两条仍绿，证明漏移账单不能提交半档。
+  主代理已原样恢复 ledger UPDATE，再跑以下影响面与 Clippy，均取得真实绿。
+- 主代理验证（2026-10-13；每条先准备本 worktree 独立外置 target，并由 Node 权威 target
+  守卫脚本在 fork 目录核验；不使用全 features，不启用本机模型推理）：
+
+  | 验证 | 实际命令与回执 |
+  |---|---|
+  | 会话存储影响面，含三条原子归档回归 | `cargo test -p goose --lib --no-default-features --features rustls-tls,code-mode,tree-sitter,live-voice,scheduler,platform-apps,chat-recall,acp-http -- session::session_manager::tests --test-threads=1`；`56 passed / 0 failed`，`rc=0`；日志 `/tmp/runtime-session-archive-20261013-session-tests.log` |
+  | 同 feature 集 Clippy | `cargo clippy -p goose --lib --tests --no-default-features --features rustls-tls,code-mode,tree-sitter,live-voice,scheduler,platform-apps,chat-recall,acp-http -- -D warnings`；`rc=0` 且包含 `Checking goose v1.54.0`；日志 `/tmp/runtime-session-archive-20261013-clippy.log` |
+
+  本施工子代理未运行任何 cargo、未提交；精确提交与本地合入由主代理执行。不推送，E2E 未运行。
+  本格不把专项通过写成全 fork 测试或跨仓 Node 消费验证通过。
 
 ## 上游 PR 材料（⚠️ 尚未提交）
 

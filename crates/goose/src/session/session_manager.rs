@@ -566,6 +566,18 @@ impl SessionManager {
         self.storage.delete_session(id).await
     }
 
+    /// 原子移动一代会话到调用方指定的归档身份，不另铸活跃会话 ID。
+    ///
+    /// `copy_session` 不复制逐请求账单，随后删除原会话会永久丢掉证据；本入口只改身份引用
+    /// 与真实归档时刻，原消息、账单、元数据及父子关系都保留在同一 SQLite 事务中。
+    ///
+    /// # Errors
+    ///
+    /// 原身份缺失、目标碰撞、同一身份或任一存储失败均返回错误；写入失败整批回滚。
+    pub async fn archive_session(&self, id: &str, archived_id: &str) -> Result<Session> {
+        self.storage.archive_session(id, archived_id).await
+    }
+
     pub async fn get_insights(&self) -> Result<SessionInsights> {
         self.storage
             .get_insights(&[SessionType::User, SessionType::Scheduled])
@@ -2566,6 +2578,53 @@ impl SessionStorage {
 
         tx.commit().await?;
         Ok(())
+    }
+
+    async fn archive_session(&self, session_id: &str, archived_id: &str) -> Result<Session> {
+        if session_id == archived_id {
+            anyhow::bail!("归档身份不能与原会话身份相同");
+        }
+        let pool = self.pool().await?;
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+        // 只延迟本事务的外键检查，提交时必须全部恢复一致；不能关闭连接级外键保护。
+        sqlx::query("PRAGMA defer_foreign_keys = ON")
+            .execute(&mut *tx)
+            .await?;
+        let moved =
+            sqlx::query("UPDATE sessions SET id = ?, archived_at = CURRENT_TIMESTAMP WHERE id = ?")
+                .bind(archived_id)
+                .bind(session_id)
+                .execute(&mut *tx)
+                .await?;
+        if moved.rows_affected() == 0 {
+            anyhow::bail!("Session not found");
+        }
+        for statement in [
+            "UPDATE messages SET session_id = ? WHERE session_id = ?",
+            "UPDATE usage_ledger SET session_id = ? WHERE session_id = ?",
+            "UPDATE sessions SET parent_session_id = ? WHERE parent_session_id = ?",
+        ] {
+            sqlx::query(statement)
+                .bind(archived_id)
+                .bind(session_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        // 上游新库入口未创建旧线程表；存在时来源一起移动，不以吞 SQL 错误冒充表缺席。
+        let has_thread_messages = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'thread_messages')",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        if has_thread_messages {
+            sqlx::query("UPDATE thread_messages SET session_id = ? WHERE session_id = ?")
+                .bind(archived_id)
+                .bind(session_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        self.get_session(archived_id, true).await
     }
 
     async fn get_insights(&self, types: &[SessionType]) -> Result<SessionInsights> {
@@ -5388,6 +5447,292 @@ mod tests {
         assert_eq!(totals.accumulated_usage.input_tokens, Some(400));
         assert_eq!(totals.accumulated_usage.output_tokens, Some(80));
         assert!((totals.accumulated_cost.unwrap() - 0.35).abs() < 1e-9);
+    }
+
+    /// 逐列保留 SQLite 原值；不重建消息或金额，避免 copy/delete 丢证据仍被累计值掩盖。
+    async fn archive_rows(sm: &SessionManager, table: &str, excluded: &[&str]) -> Vec<Vec<String>> {
+        use sqlx::Row;
+        assert!(matches!(
+            table,
+            "sessions" | "messages" | "usage_ledger" | "thread_messages"
+        ));
+        let pool = sm.storage().pool().await.unwrap();
+        let columns = sqlx::query(AssertSqlSafe(format!("PRAGMA table_info({table})")))
+            .fetch_all(pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get::<String, _>("name"))
+            .filter(|name| !excluded.contains(&name.as_str()))
+            .collect::<Vec<_>>();
+        let selected = columns
+            .iter()
+            .map(|column| format!("quote(\"{column}\")"))
+            .collect::<Vec<_>>()
+            .join(",");
+        sqlx::query(AssertSqlSafe(format!(
+            "SELECT {selected} FROM {table} ORDER BY id"
+        )))
+        .fetch_all(pool)
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| (0..columns.len()).map(|index| row.get(index)).collect())
+        .collect()
+    }
+
+    async fn archive_database_rows(sm: &SessionManager) -> Vec<Vec<Vec<String>>> {
+        let mut result = Vec::new();
+        for table in ["sessions", "messages", "usage_ledger", "thread_messages"] {
+            result.push(archive_rows(sm, table, &[]).await);
+        }
+        result
+    }
+
+    async fn archive_fixture() -> (TempDir, SessionManager, String, String, String) {
+        let directory = TempDir::new().unwrap();
+        let sm = SessionManager::new(directory.path().to_path_buf());
+        let parent = new_session(&sm).await;
+        let child = new_session(&sm).await;
+        let grandchild = new_session(&sm).await;
+        sm.update(&child)
+            .parent_session_id(Some(parent.clone()))
+            .apply()
+            .await
+            .unwrap();
+        sm.update(&grandchild)
+            .parent_session_id(Some(child.clone()))
+            .apply()
+            .await
+            .unwrap();
+        sm.add_message(&parent, &Message::user().with_text("上一代主人的完整指令"))
+            .await
+            .unwrap();
+        sm.add_message(
+            &parent,
+            &Message::assistant().with_text("上一代分身的真实落盘回答"),
+        )
+        .await
+        .unwrap();
+        sm.record_usage_metrics(
+            &parent,
+            None,
+            Usage::new(Some(100), Some(20), Some(120)),
+            "archive-model-a",
+            &message_usage(100, 20, 0.125, false),
+        )
+        .await
+        .unwrap();
+        seed_ledger(&sm, &parent, &message_usage(30, 5, 0.0625, true))
+            .await
+            .unwrap();
+        seed_ledger(&sm, &child, &message_usage(7, 3, 0.03125, false))
+            .await
+            .unwrap();
+        sm.set_extension_value(
+            &parent,
+            "hasn_native_source",
+            "v1",
+            serde_json::json!({"source_input_hash": "持久来源证据", "resume_seed": "旧一代种子"}),
+        )
+        .await
+        .unwrap();
+        let pool = sm.storage().pool().await.unwrap();
+        // 新库入口未建线程表；让真实 runner 从 v9 执行后续迁移，不复制线程 schema。
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        sqlx::query("DELETE FROM schema_version")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        SessionStorage::update_schema_version(&mut tx, 9)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        SessionStorage::run_migrations(pool).await.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('threads','thread_messages')",
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+            2,
+            "真实迁移 runner 必须在写夹具前建立两张线程表",
+        );
+        sqlx::query("INSERT INTO threads(id,name) VALUES ('archive_thread','原线程')")
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO thread_messages(thread_id,session_id,message_id,role,content_json,created_timestamp,metadata_json) VALUES ('archive_thread',?,'thread_message','user','[{\"type\":\"text\",\"text\":\"线程原消息\"}]',1770000000,'{\"origin\":\"原来源\"}')")
+            .bind(&parent).execute(pool).await.unwrap();
+        sqlx::query("UPDATE sessions SET name='主人命名', description='原会话说明', user_set_name=1, created_at='2026-09-01 01:02:03', updated_at='2026-09-02 04:05:06', archived_at='2026-09-03 07:08:09', system_prompt_override='固定提示词', system_prompt_extras_json='{\"expert\":\"原专家正文\"}', project_id='原项目', accumulated_cost=0.1875 WHERE id=?")
+            .bind(&parent).execute(pool).await.unwrap();
+        sqlx::query(
+            "UPDATE messages SET tokens=19,timestamp='2026-09-02 04:05:06' WHERE session_id=?",
+        )
+        .bind(&parent)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE usage_ledger SET cache_read_tokens=11,cache_write_tokens=13,created_timestamp=1770000000 WHERE session_id=?")
+            .bind(&parent).execute(pool).await.unwrap();
+        assert!(directory
+            .path()
+            .join(SESSIONS_FOLDER)
+            .join(DB_NAME)
+            .is_file());
+        (directory, sm, parent, child, grandchild)
+    }
+
+    #[tokio::test]
+    async fn archive_session_moves_original_rows_and_preserves_evidence_and_children() {
+        let (_directory, sm, parent, child, grandchild) = archive_fixture().await;
+        let before = sm.get_session(&parent, true).await.unwrap();
+        let sessions =
+            archive_rows(&sm, "sessions", &["id", "archived_at", "parent_session_id"]).await;
+        let messages = archive_rows(&sm, "messages", &["session_id"]).await;
+        let ledger = archive_rows(&sm, "usage_ledger", &["session_id"]).await;
+        let thread_messages = archive_rows(&sm, "thread_messages", &["session_id"]).await;
+        let archived_id = "caller.superseded.1";
+        let started = Utc::now().timestamp();
+        let archived = sm.archive_session(&parent, archived_id).await.unwrap();
+        assert_eq!(archived.id, archived_id);
+        assert!(
+            sm.get_session(&parent, true).await.is_err(),
+            "归档后必须释放原活跃身份"
+        );
+        assert_eq!(archived.conversation, before.conversation);
+        assert_eq!(archived.created_at, before.created_at);
+        assert_eq!(archived.updated_at, before.updated_at);
+        assert_eq!(archived.name, "主人命名");
+        assert!(archived.archived_at.unwrap().timestamp() >= started);
+        assert!(archived.archived_at.unwrap().timestamp() <= Utc::now().timestamp());
+        let mut sessions_after =
+            archive_rows(&sm, "sessions", &["id", "archived_at", "parent_session_id"]).await;
+        let mut sessions = sessions;
+        sessions.sort();
+        sessions_after.sort();
+        assert_eq!(
+            sessions_after, sessions,
+            "除了归档身份和真实归档时刻，原会话元数据不得重写"
+        );
+        assert_eq!(
+            archive_rows(&sm, "messages", &["session_id"]).await,
+            messages,
+            "消息内部 row id、正文、metadata、时间和token逐字保留"
+        );
+        assert_eq!(
+            archive_rows(&sm, "usage_ledger", &["session_id"]).await,
+            ledger,
+            "每请求账单 row id、model、时间、cache、cost_source逐字保留"
+        );
+        assert_eq!(
+            archive_rows(&sm, "thread_messages", &["session_id"]).await,
+            thread_messages,
+            "线程正文与metadata不变，仅原会话来源身份跟随归档"
+        );
+        assert_eq!(
+            sm.get_session(&child, false)
+                .await
+                .unwrap()
+                .parent_session_id
+                .as_deref(),
+            Some(archived_id)
+        );
+        assert_eq!(
+            sm.get_session(&grandchild, false)
+                .await
+                .unwrap()
+                .parent_session_id
+                .as_deref(),
+            Some(child.as_str())
+        );
+        let pool = sm.storage().pool().await.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM messages WHERE session_id=?")
+                .bind(archived_id)
+                .fetch_one(pool)
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM usage_ledger WHERE session_id=?")
+                .bind(archived_id)
+                .fetch_one(pool)
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM thread_messages WHERE session_id=?")
+                .bind(archived_id)
+                .fetch_one(pool)
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(sqlx::query("PRAGMA foreign_key_check")
+            .fetch_all(pool)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("PRAGMA foreign_keys")
+                .fetch_one(pool)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("PRAGMA defer_foreign_keys")
+                .fetch_one(pool)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn archive_session_rejects_missing_same_id_and_collision_without_changes() {
+        let (_directory, sm, parent, child, _grandchild) = archive_fixture().await;
+        let before = archive_database_rows(&sm).await;
+        for (source, target) in [
+            (parent.as_str(), parent.as_str()),
+            (parent.as_str(), child.as_str()),
+            ("missing_session", "unused_archive"),
+        ] {
+            assert!(
+                sm.archive_session(source, target).await.is_err(),
+                "同ID、碰撞或缺失必须拒绝，不假成功"
+            );
+            assert_eq!(
+                archive_database_rows(&sm).await,
+                before,
+                "拒绝不能改写原会话或关联证据"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn archive_session_rolls_back_every_write_failure() {
+        for statement in [
+            "CREATE TRIGGER archive_failure BEFORE UPDATE OF id ON sessions BEGIN SELECT RAISE(ABORT,'归档身份写入故障'); END",
+            "CREATE TRIGGER archive_failure BEFORE UPDATE OF session_id ON messages BEGIN SELECT RAISE(ABORT,'归档消息写入故障'); END",
+            "CREATE TRIGGER archive_failure BEFORE UPDATE OF session_id ON usage_ledger BEGIN SELECT RAISE(ABORT,'归档账单写入故障'); END",
+            "CREATE TRIGGER archive_failure BEFORE UPDATE OF parent_session_id ON sessions BEGIN SELECT RAISE(ABORT,'归档子会话写入故障'); END",
+            "CREATE TRIGGER archive_failure BEFORE UPDATE OF session_id ON thread_messages BEGIN SELECT RAISE(ABORT,'归档线程来源写入故障'); END",
+        ] {
+            let (_directory, sm, parent, _child, _grandchild) = archive_fixture().await;
+            let pool = sm.storage().pool().await.unwrap();
+            sqlx::query(statement).execute(pool).await.unwrap();
+            let before = archive_database_rows(&sm).await;
+            assert!(sm.archive_session(&parent, "caller.superseded.failure").await.is_err(), "真实SQLite写入失败必须上抛");
+            assert_eq!(archive_database_rows(&sm).await, before, "任一写点失败，原身份、元数据、消息、账单及子会话全部回滚");
+            assert_eq!(sqlx::query_scalar::<_, i64>("PRAGMA foreign_keys").fetch_one(pool).await.unwrap(), 1);
+            assert_eq!(sqlx::query_scalar::<_, i64>("PRAGMA defer_foreign_keys").fetch_one(pool).await.unwrap(), 0);
+            assert!(sqlx::query("PRAGMA foreign_key_check").fetch_all(pool).await.unwrap().is_empty());
+        }
     }
 
     #[tokio::test]
